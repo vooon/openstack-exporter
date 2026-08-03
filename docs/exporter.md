@@ -277,7 +277,13 @@ Source and emitter conventions:
 10. Implement emitter methods that read `*myScrape` and emit metrics.
 11. Add fixtures and a test suite under `exporters/`.
 12. Add the suite to `TestOpenStackSuites` in `exporters/exporter_test.go`.
-13. Run focused tests:
+13. Regenerate metrics documentation:
+
+    ```sh
+    go run ./script/generate-metrics-doc.go
+    ```
+
+14. Run focused tests:
 
     ```sh
     env -u OS_COMPUTE_API_VERSION go test . ./cache ./exporters ./utils
@@ -294,3 +300,6 @@ Before opening a PR, check these names:
 * Emitter `Metrics` entries exactly match descriptor local metric names.
 * Test expected output uses full Prometheus names:
   `openstack_<exporter-name>_<metric>`.
+
+The generated metrics documentation lists both full metric names and option keys
+in [metrics.md](metrics.md).
