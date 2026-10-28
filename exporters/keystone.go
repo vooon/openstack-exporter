@@ -11,148 +11,150 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/domains"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/groups"
+	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/projects"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/regions"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/users"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-type KeystoneExporter struct {
-	BaseOpenStackExporter
+func init() {
+	RegisterTypedExporter("identity", NewKeystoneExporter)
 }
 
-var defaultKeystoneMetrics = []Metric{
-	{Name: "domains", Fn: ListDomains},
-	{Name: "domain_info", Labels: []string{"description", "enabled", "id", "name"}},
-	{Name: "users", Fn: ListUsers},
-	{Name: "groups", Fn: ListGroups},
-	{Name: "projects", Fn: ListProjects},
-	{Name: "project_info", Labels: []string{"is_domain", "description", "domain_id", "enabled", "id", "name", "parent_id", "tags"}},
-	{Name: "regions", Fn: ListRegions},
+type KeystoneExporter struct {
+	BaseOpenStackExporter
+	descs keystoneDescs
+	sched Schedule[keystoneScrape]
+}
+
+type keystoneDescs struct {
+	Domains     *prometheus.Desc `metric:"domains"`
+	DomainInfo  *prometheus.Desc `metric:"domain_info"  labels:"description,enabled,id,name"`
+	Users       *prometheus.Desc `metric:"users"`
+	Groups      *prometheus.Desc `metric:"groups"`
+	Projects    *prometheus.Desc `metric:"projects"`
+	ProjectInfo *prometheus.Desc `metric:"project_info" labels:"is_domain,description,domain_id,enabled,id,name,parent_id,tags"`
+	Regions     *prometheus.Desc `metric:"regions"`
+}
+
+type keystoneScrape struct {
+	domains  []domains.Domain
+	users    []users.User
+	groups   []groups.Group
+	projects []projects.Project
+	regions  []regions.Region
 }
 
 func NewKeystoneExporter(config *ExporterConfig, logger *slog.Logger) (*KeystoneExporter, error) {
-	exporter := KeystoneExporter{
-		BaseOpenStackExporter{
+	e := &KeystoneExporter{
+		BaseOpenStackExporter: BaseOpenStackExporter{
 			Name:           "identity",
 			ExporterConfig: *config,
 			logger:         logger,
 		},
 	}
-
-	for _, metric := range defaultKeystoneMetrics {
-		if exporter.isDeprecatedMetric(&metric) {
-			continue
-		}
-		if !exporter.isSlowMetric(&metric) {
-			exporter.AddMetric(metric.Name, metric.Fn, metric.Labels, metric.DeprecatedVersion, nil)
-		}
+	graph := Graph[keystoneScrape]{
+		Sources: []Source[keystoneScrape]{
+			{Name: "domains", Fetch: e.fetchDomains},
+			{Name: "users", Fetch: e.fetchUsers},
+			{Name: "groups", Fetch: e.fetchGroups},
+			{Name: "projects", Fetch: e.fetchProjects},
+			{Name: "regions", Fetch: e.fetchRegions},
+		},
+		Emitters: []Emitter[keystoneScrape]{
+			{Name: "domains", Metrics: []string{"domains", "domain_info"}, Sources: []string{"domains"}, Emit: e.emitDomains},
+			{Name: "users", Metrics: []string{"users"}, Sources: []string{"users"}, Emit: e.emitUsers},
+			{Name: "groups", Metrics: []string{"groups"}, Sources: []string{"groups"}, Emit: e.emitGroups},
+			{Name: "projects", Metrics: []string{"projects", "project_info"}, Sources: []string{"projects"}, Emit: e.emitProjects},
+			{Name: "regions", Metrics: []string{"regions"}, Sources: []string{"regions"}, Emit: e.emitRegions},
+		},
 	}
-
-	return &exporter, nil
+	sched, err := SetupExporter(&e.BaseOpenStackExporter, &e.descs, &graph)
+	if err != nil {
+		return nil, err
+	}
+	e.sched = sched
+	return e, nil
 }
 
-func ListDomains(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	var allDomains []domains.Domain
+func (e *KeystoneExporter) Collect(ch chan<- prometheus.Metric) {
+	CollectSchedule(&e.BaseOpenStackExporter, &e.sched, new(keystoneScrape), ch)
+}
 
-	allPagesDomain, err := domains.List(exporter.ClientV2, domains.ListOpts{}).AllPages(ctx)
+func (e *KeystoneExporter) fetchDomains(ctx context.Context, s *keystoneScrape) error {
+	allPages, err := domains.List(e.ClientV2, domains.ListOpts{}).AllPages(ctx)
 	if err != nil {
 		return err
 	}
+	s.domains, err = domains.ExtractDomains(allPages)
+	return err
+}
 
-	allDomains, err = domains.ExtractDomains(allPagesDomain)
+func (e *KeystoneExporter) fetchUsers(ctx context.Context, s *keystoneScrape) error {
+	allPages, err := users.List(e.ClientV2, users.ListOpts{DomainID: e.DomainID}).AllPages(ctx)
 	if err != nil {
 		return err
 	}
+	s.users, err = users.ExtractUsers(allPages)
+	return err
+}
 
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["domains"].Metric,
-		prometheus.GaugeValue, float64(len(allDomains)))
-
-	if !exporter.MetricIsDisabled("domain_info") {
-		for _, d := range allDomains {
-			ch <- prometheus.MustNewConstMetric(exporter.Metrics["domain_info"].Metric,
-				prometheus.GaugeValue, 1.0,
-				d.Description, strconv.FormatBool(d.Enabled), d.ID, d.Name)
-		}
+func (e *KeystoneExporter) fetchGroups(ctx context.Context, s *keystoneScrape) error {
+	allPages, err := groups.List(e.ClientV2, groups.ListOpts{DomainID: e.DomainID}).AllPages(ctx)
+	if err != nil {
+		return err
 	}
+	s.groups, err = groups.ExtractGroups(allPages)
+	return err
+}
 
+func (e *KeystoneExporter) fetchProjects(ctx context.Context, s *keystoneScrape) error {
+	var err error
+	s.projects, err = GetProjects(ctx, &e.BaseOpenStackExporter)
+	return err
+}
+
+func (e *KeystoneExporter) fetchRegions(ctx context.Context, s *keystoneScrape) error {
+	allPages, err := regions.List(e.ClientV2, regions.ListOpts{}).AllPages(ctx)
+	if err != nil {
+		return err
+	}
+	s.regions, err = regions.ExtractRegions(allPages)
+	return err
+}
+
+func (e *KeystoneExporter) emitDomains(_ context.Context, s *keystoneScrape, ch chan<- prometheus.Metric) error {
+	emitGauge(ch, e.descs.Domains, float64(len(s.domains)))
+	for i := range s.domains {
+		d := &s.domains[i]
+		emitGauge(ch, e.descs.DomainInfo, 1.0, d.Description, strconv.FormatBool(d.Enabled), d.ID, d.Name)
+	}
 	return nil
 }
 
-func ListProjects(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	allProjects, err := GetProjects(ctx, exporter)
-	if err != nil {
-		return err
-	}
-
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["projects"].Metric,
-		prometheus.GaugeValue, float64(len(allProjects)))
-
-	if !exporter.MetricIsDisabled("project_info") {
-		for _, p := range allProjects {
-			ch <- prometheus.MustNewConstMetric(exporter.Metrics["project_info"].Metric,
-				prometheus.GaugeValue, 1.0, strconv.FormatBool(p.IsDomain),
-				p.Description, p.DomainID, strconv.FormatBool(p.Enabled), p.ID, p.Name,
-				p.ParentID, strings.Join(p.Tags, ","))
-		}
-	}
-
+func (e *KeystoneExporter) emitUsers(_ context.Context, s *keystoneScrape, ch chan<- prometheus.Metric) error {
+	emitGauge(ch, e.descs.Users, float64(len(s.users)))
 	return nil
 }
 
-func ListRegions(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	var allRegions []regions.Region
-
-	allPagesRegion, err := regions.List(exporter.ClientV2, regions.ListOpts{}).AllPages(ctx)
-	if err != nil {
-		return err
-	}
-
-	allRegions, err = regions.ExtractRegions(allPagesRegion)
-	if err != nil {
-		return err
-	}
-
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["regions"].Metric,
-		prometheus.GaugeValue, float64(len(allRegions)))
-
+func (e *KeystoneExporter) emitGroups(_ context.Context, s *keystoneScrape, ch chan<- prometheus.Metric) error {
+	emitGauge(ch, e.descs.Groups, float64(len(s.groups)))
 	return nil
 }
 
-func ListUsers(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	var allUsers []users.User
-
-	allPagesUser, err := users.List(exporter.ClientV2, users.ListOpts{DomainID: exporter.DomainID}).AllPages(ctx)
-	if err != nil {
-		return err
+func (e *KeystoneExporter) emitProjects(_ context.Context, s *keystoneScrape, ch chan<- prometheus.Metric) error {
+	emitGauge(ch, e.descs.Projects, float64(len(s.projects)))
+	for i := range s.projects {
+		p := &s.projects[i]
+		emitGauge(ch, e.descs.ProjectInfo, 1.0, strconv.FormatBool(p.IsDomain),
+			p.Description, p.DomainID, strconv.FormatBool(p.Enabled), p.ID, p.Name,
+			p.ParentID, strings.Join(p.Tags, ","))
 	}
-
-	allUsers, err = users.ExtractUsers(allPagesUser)
-	if err != nil {
-		return err
-	}
-
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["users"].Metric,
-		prometheus.GaugeValue, float64(len(allUsers)))
-
 	return nil
 }
 
-func ListGroups(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	var allGroups []groups.Group
-
-	allPagesGroup, err := groups.List(exporter.ClientV2, groups.ListOpts{DomainID: exporter.DomainID}).AllPages(ctx)
-	if err != nil {
-		return err
-	}
-
-	allGroups, err = groups.ExtractGroups(allPagesGroup)
-	if err != nil {
-		return err
-	}
-
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["groups"].Metric,
-		prometheus.GaugeValue, float64(len(allGroups)))
-
+func (e *KeystoneExporter) emitRegions(_ context.Context, s *keystoneScrape, ch chan<- prometheus.Metric) error {
+	emitGauge(ch, e.descs.Regions, float64(len(s.regions)))
 	return nil
 }
 
