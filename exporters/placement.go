@@ -183,35 +183,3 @@ func emitPlacementAllocations(descs *placementDescs, s *placementScrape, ch chan
 		}
 	}
 }
-
-// ListPlacementResourceProviders collects every placement metric of exporter
-// in one sequential pass outside the schedule: the provider list, then the
-// inventories, usages and (when resource_provider_allocations is enabled)
-// allocations of each provider. It is kept for placement_benchmark_test.go,
-// which times this path on the base of an exporter built by
-// NewPlacementExporter; Collect runs the DAG schedule instead.
-func ListPlacementResourceProviders(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	var descs placementDescs
-	exporter.registerDescs(&descs)
-
-	s := new(placementScrape)
-	if err := fetchPlacementProviders(ctx, exporter.ClientV2, s); err != nil {
-		return err
-	}
-	if err := fetchPlacementInventories(ctx, exporter.ClientV2, s); err != nil {
-		return err
-	}
-	if err := fetchPlacementUsages(ctx, exporter.ClientV2, s); err != nil {
-		return err
-	}
-	if descs.ResourceProviderAllocations != nil {
-		if err := fetchPlacementAllocations(ctx, exporter.ClientV2, s); err != nil {
-			return err
-		}
-	}
-
-	emitPlacementInventories(&descs, s, ch)
-	emitPlacementUsages(&descs, s, ch)
-	emitPlacementAllocations(&descs, s, ch)
-	return nil
-}
