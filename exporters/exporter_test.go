@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"regexp"
 	"testing"
 
 	"log/slog"
@@ -14,6 +15,20 @@ import (
 	"github.com/openstack-exporter/openstack-exporter/utils"
 	"github.com/stretchr/testify/suite"
 )
+
+// metricNamesFrom extracts the metric family names from an expected
+// text-format string. Pass the result to testutil.CollectAndCompare so the
+// comparison covers exactly the families the test declares and ignores the
+// exporter instrumentation families (scrape counters, durations).
+var metricNameRe = regexp.MustCompile(`(?m)^# HELP (\S+)`)
+
+func metricNamesFrom(expected string) []string {
+	var names []string
+	for _, m := range metricNameRe.FindAllStringSubmatch(expected, -1) {
+		names = append(names, m[1])
+	}
+	return names
+}
 
 const baseFixturePath = "./fixtures"
 const cloudName = "test.cloud"
