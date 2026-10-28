@@ -47,11 +47,8 @@ func (m *mockOpenStackExporter) GetName() string {
 	return "MockOpenStackExporter"
 }
 
-func (m *mockOpenStackExporter) AddMetric(name string, fn exporters.ListFunc, labels []string, deprecatedVersion string, constLabels prometheus.Labels) {
-}
-
-func (m *mockOpenStackExporter) MetricIsDisabled(name string) bool {
-	return false
+func (m *mockOpenStackExporter) IsMetricEnabled(names ...string) bool {
+	return true
 }
 
 func TestCollectCache(t *testing.T) {

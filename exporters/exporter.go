@@ -47,8 +47,8 @@ type OpenStackExporter interface {
 	prometheus.Collector
 
 	GetName() string
-	AddMetric(name string, fn ListFunc, labels []string, deprecatedVersion string, constLabels prometheus.Labels)
-	MetricIsDisabled(name string) bool
+	// IsMetricEnabled reports whether any of the named metrics is collected.
+	IsMetricEnabled(names ...string) bool
 }
 
 func EnableExporter(service string, opts ExporterOptions, logger *slog.Logger) (*OpenStackExporter, error) {
@@ -73,8 +73,11 @@ type ExporterOptions struct {
 	// Prefix is the metric name prefix (default: "openstack").
 	Prefix string
 	// DisabledMetrics lists "exporter-metric" keys to suppress entirely
-	// (e.g. "cinder-snapshots").
+	// (e.g. "cinder-snapshots"). It wins over EnabledMetrics.
 	DisabledMetrics []string
+	// EnabledMetrics lists "exporter-metric" keys that stay enabled despite
+	// DisableSlowMetrics or DisableDeprecatedMetrics (e.g. "nova-limits_vcpus_max").
+	EnabledMetrics []string
 	// EndpointType selects the OpenStack endpoint to connect to
 	// ("public", "internal" or "admin").
 	EndpointType string
@@ -111,9 +114,19 @@ type ExporterConfig struct {
 
 type BaseOpenStackExporter struct {
 	ExporterConfig
-	Name    string
+	Name string
+	// Metrics is the legacy callback registry filled by AddMetric. DAG
+	// exporters leave it nil and declare metrics through SetupExporter.
 	Metrics map[string]*PrometheusMetric
 	logger  *slog.Logger
+
+	// DAG exporter state, populated by SetupExporter.
+	metricEnabled       map[string]bool    // resolved policy, keyed by local metric name
+	allDescs            []*prometheus.Desc // descriptors created by registerDescs and RegisterDesc
+	upDesc              *prometheus.Desc
+	scrapesTotal        prometheus.Counter
+	scrapeErrors        prometheus.Counter
+	sourceFetchDuration *prometheus.HistogramVec
 }
 
 type ListFunc func(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error
@@ -125,6 +138,15 @@ var (
 
 func (exporter *BaseOpenStackExporter) GetName() string {
 	return fmt.Sprintf("%s_%s", exporter.Prefix, exporter.Name)
+}
+
+// log returns the exporter logger, falling back to the default logger when
+// the exporter was built without one, as happens in unit tests.
+func (exporter *BaseOpenStackExporter) log() *slog.Logger {
+	if exporter.logger == nil {
+		return slog.Default()
+	}
+	return exporter.logger
 }
 
 func (exporter *BaseOpenStackExporter) MetricIsDisabled(name string) bool {
@@ -139,6 +161,17 @@ func (exporter *BaseOpenStackExporter) MetricIsDisabled(name string) bool {
 func (exporter *BaseOpenStackExporter) Describe(ch chan<- *prometheus.Desc) {
 	for _, metric := range exporter.Metrics {
 		ch <- metric.Metric
+	}
+	if exporter.upDesc != nil {
+		ch <- exporter.upDesc
+		ch <- exporter.scrapesTotal.Desc()
+		ch <- exporter.scrapeErrors.Desc()
+	}
+	if exporter.sourceFetchDuration != nil {
+		exporter.sourceFetchDuration.Describe(ch)
+	}
+	for _, d := range exporter.allDescs {
+		ch <- d
 	}
 }
 
@@ -206,11 +239,11 @@ func (exporter *BaseOpenStackExporter) Collect(ch chan<- prometheus.Metric) {
 }
 
 func (exporter *BaseOpenStackExporter) isSlowMetric(metric *Metric) bool {
-	return exporter.DisableSlowMetrics && metric.Slow
+	return exporter.DisableSlowMetrics && metric.Slow && !exporter.isExplicitlyEnabled(metric.Name)
 }
 
 func (exporter *BaseOpenStackExporter) isDeprecatedMetric(metric *Metric) bool {
-	return exporter.DisableDeprecatedMetrics && len(metric.DeprecatedVersion) > 0
+	return exporter.DisableDeprecatedMetrics && len(metric.DeprecatedVersion) > 0 && !exporter.isExplicitlyEnabled(metric.Name)
 }
 
 func (exporter *BaseOpenStackExporter) AddMetric(name string, fn ListFunc, labels []string, deprecatedVersion string, constLabels prometheus.Labels) {
@@ -359,6 +392,10 @@ func NewExporter(name string, opts ExporterOptions, logger *slog.Logger) (OpenSt
 		ExporterOptions: opts,
 		ClientV2:        clientV2,
 		ServiceName:     name,
+	}
+
+	if factory, ok := exporterRegistry[name]; ok {
+		return factory(&exporterConfig, logger)
 	}
 
 	switch name {
