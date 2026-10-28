@@ -194,6 +194,12 @@ func NewNovaExporter(config *ExporterConfig, logger *slog.Logger) (*NovaExporter
 
 	// server_status carries extra labels from NovaMetadataMapping, so its
 	// descriptor is declared dynamically instead of through a struct tag.
+	// A mapped label that collides with a fixed one would make NewDesc record
+	// an error and the first emission panic, so reject it at construction.
+	if err := config.NovaMetadataMapping.ValidateAgainst(novaServerStatusBaseLabels); err != nil {
+		return nil, fmt.Errorf("nova.metadata-extra-labels: %w", err)
+	}
+
 	serverStatus := WithDynamicMetrics([]string{"server_status"}, func(base *BaseOpenStackExporter) {
 		if !base.IsMetricEnabled("server_status") {
 			return

@@ -96,7 +96,8 @@ disabled metric loses its descriptor *and* the API calls that only it needed.
 source to guard an extra request that feeds only some of the source's metrics.
 
 Metrics whose label set is only known at runtime (Nova's `server_status` with
-`--nova.metadata-extra-labels`) are declared with `WithDynamicMetrics`: the
+`--nova.metadata-extra-labels`, Ironic's `node` with `--ironic.node-extra-labels`)
+are declared with `WithDynamicMetrics`: the
 callback runs after policy resolution, builds the descriptor when the metric
 is enabled and hands it to `RegisterDesc`.
 

@@ -70,6 +70,9 @@ var (
 	disableServiceAutodetect = kingpin.Flag("disable-service-autodetect", "Disable single-cloud service autodetection and use only explicit service flags").Default("false").Bool()
 	novaMetadataMapping      = utils.LabelMapping(kingpin.Flag("nova.metadata-extra-labels", "Map provided server metadata keys to labels in openstack_nova_server_status metric").PlaceHolder("LABEL=KEY,KEY").Default(""))
 	reloadInterval           = kingpin.Flag("reload-interval", "How often services are re-detected and every collector is re-bound; SIGHUP reloads at any time; 0 disables the timer").Default("1h").Duration()
+	ironicNodeExtraLabels    = utils.QualifiedLabelMapping(kingpin.Flag("ironic.node-extra-labels",
+		"Map Ironic node dictionary keys to labels in openstack_ironic_node metric; keys are qualified with the dictionary they come from ("+strings.Join(exporters.IronicNodeInfoMaps(), ", ")+")").
+		PlaceHolder("LABEL=DICT.KEY,DICT.KEY").Default(exporters.DefaultIronicNodeExtraLabels))
 	dnsConcurrentCount       = kingpin.Flag("dns-concurrent-count", "Number of concurrent requests for DNS recordset collection").Default("10").Int()
 	apiDetailConcurrentCount = kingpin.Flag("api-detail-concurrent-count", "Number of concurrent requests for per-resource API detail collection (project limits and quotas, router L3 agents)").Default("10").Int()
 	placementConcurrentCount = kingpin.Flag("placement-concurrent-count", "Number of concurrent requests for Placement provider detail collection").Default("10").Int()
@@ -103,6 +106,8 @@ func main() {
 	kingpin.Parse()
 	logger := promslog.New(promlogConfig)
 	logger.Info("Build Version", "version_info", version.Info(), "build_context", version.BuildContext())
+
+	warnSensitiveLabelMappings(logger)
 
 	if *cloud == "" && !*multiCloud {
 		logger.Error("openstack-exporter: error: required argument 'cloud' or flag --multi-cloud not provided, try --help")
@@ -152,6 +157,7 @@ func main() {
 		DomainID:                 *domainID,
 		TenantID:                 *tenantID,
 		NovaMetadataMapping:      novaMetadataMapping,
+		IronicNodeExtraLabels:    ironicNodeExtraLabels,
 		DnsConcurrentCount:       *dnsConcurrentCount,
 		APIDetailConcurrentCount: *apiDetailConcurrentCount,
 		PlacementConcurrentCount: *placementConcurrentCount,
@@ -664,4 +670,23 @@ func SetPasswordIfVaultIsUsed(logger *slog.Logger) {
 	}
 
 	os.Setenv("OS_PASSWORD", secret.Data.Data[vaultConfig.CredentialNameInVaultSecret].(string))
+}
+
+// warnSensitiveLabelMappings reports label mappings that name a credential.
+// Their values are redacted rather than published, but an operator who mapped
+// such a key probably did not intend to expose it at all.
+func warnSensitiveLabelMappings(logger *slog.Logger) {
+	mappings := map[string]*utils.LabelMappingFlag{
+		"--nova.metadata-extra-labels": novaMetadataMapping,
+		"--ironic.node-extra-labels":   ironicNodeExtraLabels,
+	}
+	for flag, mapping := range mappings {
+		if mapping == nil {
+			continue
+		}
+		if labels := mapping.SensitiveLabels(); len(labels) > 0 {
+			logger.Warn("label mapping names credential-bearing keys; their values are redacted",
+				"flag", flag, "labels", strings.Join(labels, ","))
+		}
+	}
 }
