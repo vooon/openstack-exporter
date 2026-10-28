@@ -127,6 +127,9 @@ Flags:
       --nova.metadata-extra-labels=LABEL=KEY,KEY ...
                                  Map provided server metadata keys to labels in
                                  openstack_nova_server_status metric
+      --ironic.node-extra-labels=LABEL=DICT.KEY,DICT.KEY ...
+                                 Map Ironic node dictionary keys to labels in openstack_ironic_node metric; keys are qualified
+                                 with the dictionary they come from (driver_info, instance_info, extra, properties, driver_internal_info)
       --api-detail-concurrent-count=10
                                  Number of concurrent requests for per-resource API detail collection
                                  (project limits and quotas, router L3 agents)
@@ -216,6 +219,31 @@ Scrape all services except `load-balancer` and `dns` from `test.cloud`:
 ```sh
 curl "https://localhost:9180/probe?cloud=test.cloud&exclude_services=load-balancer,dns"
 ```
+
+#### Ironic node labels
+
+`--ironic.node-extra-labels` exports selected keys of an Ironic node as labels
+on `openstack_ironic_node`. Keys are qualified with the node dictionary they are
+read from: `driver_info`, `instance_info`, `extra`, `properties` or
+`driver_internal_info`. The label name defaults to the last segment of the key,
+or can be given explicitly:
+
+```sh
+--ironic.node-extra-labels=driver_info.deploy_kernel,bmc=driver_info.redfish_address
+```
+
+The default is `driver_info.deploy_kernel,driver_info.deploy_ramdisk`, which
+reproduces the labels this metric carried before the option existed. Pass an
+empty value to drop them.
+
+Only top-level keys are read; a nested object such as
+`instance_info.image_properties` yields an empty label value.
+
+Values of keys that look like credentials are replaced with `***`. The check
+covers names ending in `password`, `passwd`, `secret`, `token` or `private_key`,
+plus `configdrive` and `image_url`, which Ironic redacts itself. The marker is
+only substituted when a value is actually present, so alerting on a missing
+credential still works. The same redaction applies to `--nova.metadata-extra-labels`.
 
 ### OpenStack configuration
 

@@ -195,15 +195,16 @@ func (suite *BaseOpenStackTestSuite) SetupTest() {
 
 	os.Setenv("OS_CLIENT_CONFIG_FILE", path.Join(baseFixturePath, "test_config.yaml"))
 
-	novaMetadataMapping := new(utils.LabelMappingFlag)
+	novaMetadataMapping := utils.NewLabelMappingFlag()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{}))
 	opts := ExporterOptions{
-		Cloud:               cloudName,
-		Prefix:              suite.Prefix,
-		DisabledMetrics:     []string{},
-		EndpointType:        "public",
-		NovaMetadataMapping: novaMetadataMapping,
-		DnsConcurrentCount:  10,
+		Cloud:                 cloudName,
+		Prefix:                suite.Prefix,
+		DisabledMetrics:       []string{},
+		EndpointType:          "public",
+		NovaMetadataMapping:   novaMetadataMapping,
+		IronicNodeExtraLabels: NewIronicNodeExtraLabels(),
+		DnsConcurrentCount:    10,
 		UUIDGenFunc: func() (string, error) {
 			return DEFAULT_UUID, nil
 		},
