@@ -1,13 +1,10 @@
 package exporters
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 	"os"
 	"sync"
-	"sync/atomic"
-	"time"
 
 	"log/slog"
 
@@ -17,16 +14,7 @@ import (
 	"github.com/hashicorp/go-uuid"
 	"github.com/openstack-exporter/openstack-exporter/utils"
 	"github.com/prometheus/client_golang/prometheus"
-	"golang.org/x/sync/errgroup"
 )
-
-type Metric struct {
-	Name              string
-	Labels            []string
-	Fn                ListFunc
-	Slow              bool
-	DeprecatedVersion string
-}
 
 const (
 	//nolint: deadcode, unused
@@ -39,6 +27,8 @@ const (
 	TERABYTE
 )
 
+// SupportedExporters lists the service names in the order the service flags
+// are shown. RegisterExporter appends any service that is not listed here.
 var SupportedExporters = []string{"network", "compute", "image", "volume", "identity", "object-store", "load-balancer", "container-infra", "dns", "baremetal", "gnocchi", "database", "orchestration", "placement", "sharev2"}
 
 type OpenStackExporter interface {
@@ -55,11 +45,6 @@ func EnableExporter(service string, opts ExporterOptions, logger *slog.Logger) (
 		return nil, err
 	}
 	return &exporter, nil
-}
-
-type PrometheusMetric struct {
-	Metric *prometheus.Desc
-	Fn     ListFunc
 }
 
 // ExporterOptions holds all user-supplied configuration for an exporter.
@@ -112,11 +97,8 @@ type ExporterConfig struct {
 
 type BaseOpenStackExporter struct {
 	ExporterConfig
-	Name string
-	// Metrics is the legacy callback registry filled by AddMetric. DAG
-	// exporters leave it nil and declare metrics through SetupExporter.
-	Metrics map[string]*PrometheusMetric
-	logger  *slog.Logger
+	Name   string
+	logger *slog.Logger
 
 	// DAG exporter state, populated by SetupExporter.
 	metricEnabled       map[string]bool    // resolved policy, keyed by local metric name
@@ -127,8 +109,6 @@ type BaseOpenStackExporter struct {
 	scrapeErrors        prometheus.Counter
 	sourceFetchDuration *prometheus.HistogramVec
 }
-
-type ListFunc func(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error
 
 var (
 	endpointOptsV2   map[string]gophercloudv2.EndpointOpts
@@ -148,19 +128,7 @@ func (exporter *BaseOpenStackExporter) log() *slog.Logger {
 	return exporter.logger
 }
 
-func (exporter *BaseOpenStackExporter) MetricIsDisabled(name string) bool {
-	for _, metric := range exporter.DisabledMetrics {
-		if metric == fmt.Sprintf("%s-%s", exporter.Name, name) {
-			return true
-		}
-	}
-	return false
-}
-
 func (exporter *BaseOpenStackExporter) Describe(ch chan<- *prometheus.Desc) {
-	for _, metric := range exporter.Metrics {
-		ch <- metric.Metric
-	}
 	if exporter.upDesc != nil {
 		ch <- exporter.upDesc
 		ch <- exporter.scrapesTotal.Desc()
@@ -174,125 +142,11 @@ func (exporter *BaseOpenStackExporter) Describe(ch chan<- *prometheus.Desc) {
 	}
 }
 
-func (exporter *BaseOpenStackExporter) RunCollection(metric *PrometheusMetric, metricName string, ch chan<- prometheus.Metric, logger *slog.Logger) error {
-	ctx := context.TODO()
-
-	exporter.logger.Info("Collecting metrics for exporter", "exporter", exporter.GetName(), "metrics", metricName)
-	now := time.Now()
-	err := metric.Fn(ctx, exporter, ch)
-	if err != nil {
-		return fmt.Errorf("failed to collect metric: %s, error: %s", metricName, err)
-	}
-
-	exporter.logger.Info("Collected metrics for exporter", "exporter", exporter.GetName(), "metrics", metricName)
-	if exporter.CollectTime {
-		ch <- prometheus.MustNewConstMetric(exporter.Metrics["openstack_metric_collect_seconds"].Metric, prometheus.GaugeValue, time.Since(now).Seconds(), metricName)
-	}
-
-	return nil
-}
-
-func (exporter *BaseOpenStackExporter) Collect(ch chan<- prometheus.Metric) {
-	metricsCount := 0
-	var failures int32
-
-	var g errgroup.Group
-
-	for name, metric := range exporter.Metrics {
-		if metric.Fn == nil {
-			exporter.logger.Debug("No function handler set for metric", "metric", name)
-			continue
-		}
-
-		metricsCount++
-
-		name := name
-		metric := metric
-
-		g.Go(func() error {
-			if err := exporter.RunCollection(metric, name, ch, exporter.logger); err != nil {
-				exporter.logger.Error(
-					"Failed to collect metric for exporter",
-					"exporter", exporter.Name,
-					"metric", name,
-					"err", err,
-				)
-				atomic.AddInt32(&failures, 1)
-			}
-			return nil
-		})
-	}
-
-	_ = g.Wait()
-
-	if metricsCount == 0 {
-		ch <- prometheus.MustNewConstMetric(exporter.Metrics["up"].Metric, prometheus.GaugeValue, 0)
-		return
-	}
-
-	if int(atomic.LoadInt32(&failures)) >= metricsCount {
-		ch <- prometheus.MustNewConstMetric(exporter.Metrics["up"].Metric, prometheus.GaugeValue, 0)
-	} else {
-		ch <- prometheus.MustNewConstMetric(exporter.Metrics["up"].Metric, prometheus.GaugeValue, 1)
-	}
-}
-
-func (exporter *BaseOpenStackExporter) isSlowMetric(metric *Metric) bool {
-	return exporter.DisableSlowMetrics && metric.Slow && !exporter.isExplicitlyEnabled(metric.Name)
-}
-
-func (exporter *BaseOpenStackExporter) isDeprecatedMetric(metric *Metric) bool {
-	return exporter.DisableDeprecatedMetrics && len(metric.DeprecatedVersion) > 0 && !exporter.isExplicitlyEnabled(metric.Name)
-}
-
-func (exporter *BaseOpenStackExporter) AddMetric(name string, fn ListFunc, labels []string, deprecatedVersion string, constLabels prometheus.Labels) {
-	if exporter.MetricIsDisabled(name) {
-		exporter.logger.Warn("metric has been disabled for exporter, not collecting metrics", "metric", name, "exporter", exporter.Name)
-		return
-	}
-
-	if len(deprecatedVersion) > 0 {
-		exporter.logger.Warn("metric has been deprecated on exporter in version and it will be removed in next release", "metric", name, "exporter", exporter.Name, "version", deprecatedVersion)
-	}
-
-	if exporter.Metrics == nil {
-		exporter.Metrics = make(map[string]*PrometheusMetric)
-		exporter.Metrics["up"] = &PrometheusMetric{
-			Metric: prometheus.NewDesc(
-				prometheus.BuildFQName(exporter.GetName(), "", "up"),
-				"up", nil, constLabels),
-			Fn: nil,
-		}
-		exporter.Metrics["openstack_metric_collect_seconds"] = &PrometheusMetric{
-			Metric: prometheus.NewDesc(
-				"openstack_metric_collect_seconds", "Time needed to collect metric from OpenStack API", []string{"openstack_metric"}, prometheus.Labels{"openstack_service": exporter.GetName()}),
-			Fn: nil,
-		}
-	}
-
-	if constLabels == nil {
-		constLabels = prometheus.Labels{}
-	}
-
-	// @TODO: get the region. constLabels["region"] = exporter.
-
-	if _, ok := exporter.Metrics[name]; !ok {
-		exporter.logger.Info("Adding metric to exporter", "metric", name, "exporter", exporter.Name)
-		exporter.Metrics[name] = &PrometheusMetric{
-			Metric: prometheus.NewDesc(
-				prometheus.BuildFQName(exporter.GetName(), "", name),
-				name, labels, constLabels),
-			Fn: fn,
-		}
-	}
-}
-
 func (exporter *BaseOpenStackExporter) GetDnsConcurrencyCount() int {
 	return exporter.DnsConcurrentCount
 }
 
 func NewExporter(name string, opts ExporterOptions, logger *slog.Logger) (OpenStackExporter, error) {
-	var exporter OpenStackExporter
 	var err error
 	var transport http.RoundTripper
 
@@ -320,48 +174,9 @@ func NewExporter(name string, opts ExporterOptions, logger *slog.Logger) (OpenSt
 		ServiceName:     name,
 	}
 
-	if factory, ok := exporterRegistry[name]; ok {
-		return factory(&exporterConfig, logger)
-	}
-
-	switch name {
-	case "network":
-		exporter, err = NewNeutronExporter(&exporterConfig, logger)
-	case "compute":
-		exporter, err = NewNovaExporter(&exporterConfig, logger)
-	case "image":
-		exporter, err = NewGlanceExporter(&exporterConfig, logger)
-	case "volume":
-		exporter, err = NewCinderExporter(&exporterConfig, logger)
-	case "identity":
-		exporter, err = NewKeystoneExporter(&exporterConfig, logger)
-	case "object-store":
-		exporter, err = NewObjectStoreExporter(&exporterConfig, logger)
-	case "load-balancer":
-		exporter, err = NewLoadbalancerExporter(&exporterConfig, logger)
-	case "container-infra":
-		exporter, err = NewContainerInfraExporter(&exporterConfig, logger)
-	case "dns":
-		exporter, err = NewDesignateExporter(&exporterConfig, logger)
-	case "baremetal":
-		exporter, err = NewIronicExporter(&exporterConfig, logger)
-	case "gnocchi":
-		exporter, err = NewGnocchiExporter(&exporterConfig, logger)
-	case "database":
-		exporter, err = NewTroveExporter(&exporterConfig, logger)
-	case "orchestration":
-		exporter, err = NewHeatExporter(&exporterConfig, logger)
-	case "placement":
-		exporter, err = NewPlacementExporter(&exporterConfig, logger)
-	case "sharev2":
-		exporter, err = NewManilaExporter(&exporterConfig, logger)
-	default:
+	factory, ok := exporterRegistry[name]
+	if !ok {
 		return nil, fmt.Errorf("couldn't find a handler for %s exporter", name)
 	}
-
-	if err != nil {
-		return nil, err
-	}
-
-	return exporter, nil
+	return factory(&exporterConfig, logger)
 }
