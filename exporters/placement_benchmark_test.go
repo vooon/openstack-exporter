@@ -1,7 +1,6 @@
 package exporters_test
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -40,7 +39,7 @@ type placementBenchmarkFixture struct {
 	delay     time.Duration
 }
 
-func BenchmarkPlacementListResourceProviders10000(b *testing.B) {
+func BenchmarkPlacementCollectChannel10000(b *testing.B) {
 	for _, parallel := range []bool{false, true} {
 		b.Run(placementBenchmarkParallelName(parallel), func(b *testing.B) {
 			fixture := newPlacementBenchmarkFixture(b, parallel)
@@ -55,9 +54,7 @@ func BenchmarkPlacementListResourceProviders10000(b *testing.B) {
 
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if err := exporters.ListPlacementResourceProviders(context.Background(), &fixture.exporter.BaseOpenStackExporter, ch); err != nil {
-					b.Fatalf("ListPlacementResourceProviders failed: %v", err)
-				}
+				fixture.exporter.Collect(ch)
 			}
 		})
 	}

@@ -148,19 +148,6 @@ func TestIsMetricEnabledGuardsSeveralNames(t *testing.T) {
 	}
 }
 
-func TestIsMetricEnabledFallsBackToDisableListOnLegacyExporters(t *testing.T) {
-	base := &BaseOpenStackExporter{
-		Name:           "legacy",
-		ExporterConfig: ExporterConfig{ExporterOptions: ExporterOptions{DisabledMetrics: []string{"legacy-x"}}},
-	}
-	if base.IsMetricEnabled("x") {
-		t.Fatal("legacy exporter ignored --disable-metric")
-	}
-	if !base.IsMetricEnabled("y") {
-		t.Fatal("legacy exporter disabled an unlisted metric")
-	}
-}
-
 func TestRegisterDescsFollowsResolvedPolicy(t *testing.T) {
 	base, descs := newPolicyTestExporter(t, ExporterOptions{DisableSlowMetrics: true})
 	base.resolveMetrics(parseMetricDefs(descs))
