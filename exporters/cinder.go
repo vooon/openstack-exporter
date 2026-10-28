@@ -14,6 +14,7 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/volumes"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/projects"
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sync/errgroup"
 )
 
 func init() {
@@ -207,26 +208,31 @@ func (e *CinderExporter) fetchProjects(ctx context.Context, s *cinderScrape) err
 }
 
 func (e *CinderExporter) fetchLimits(ctx context.Context, s *cinderScrape) error {
-	s.limits = make([]cinderProjectLimits, 0, len(s.projects))
-	for _, p := range s.projects {
-		// Limits and quotas are obtained from the cinder API, so this
-		// exporter's client is used.
-		usage, err := quotasets.GetUsage(ctx, e.ClientV2, p.ID).Extract()
-		if err != nil {
-			return err
-		}
-		quotas, err := quotasets.Get(ctx, e.ClientV2, p.ID).Extract()
-		if err != nil {
-			return err
-		}
-		s.limits = append(s.limits, cinderProjectLimits{
-			projectName: p.Name,
-			projectID:   p.ID,
-			usage:       usage,
-			quotas:      *quotas,
+	// Limits and quotas are obtained from the cinder API, so this exporter's
+	// client is used. Each goroutine writes its own slot of s.limits.
+	s.limits = make([]cinderProjectLimits, len(s.projects))
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(e.GetAPIDetailConcurrencyCount())
+	for i, p := range s.projects {
+		g.Go(func() error {
+			usage, err := quotasets.GetUsage(gCtx, e.ClientV2, p.ID).Extract()
+			if err != nil {
+				return err
+			}
+			quotas, err := quotasets.Get(gCtx, e.ClientV2, p.ID).Extract()
+			if err != nil {
+				return err
+			}
+			s.limits[i] = cinderProjectLimits{
+				projectName: p.Name,
+				projectID:   p.ID,
+				usage:       usage,
+				quotas:      *quotas,
+			}
+			return nil
 		})
 	}
-	return nil
+	return g.Wait()
 }
 
 func volumeServerID(volume *volumes.Volume) string {

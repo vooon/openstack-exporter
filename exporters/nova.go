@@ -21,6 +21,7 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/projects"
 	"github.com/openstack-exporter/openstack-exporter/utils"
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sync/errgroup"
 )
 
 func init() {
@@ -299,32 +300,41 @@ func (e *NovaExporter) fetchProjects(ctx context.Context, s *novaScrape) error {
 // time. Limits are obtained from the nova API, so this exporter's client
 // is used; the configured project is queried without a tenant_id filter.
 func (e *NovaExporter) fetchLimits(ctx context.Context, s *novaScrape) error {
-	s.limits = make([]novaProjectLimits, 0, len(s.projects))
-	for _, p := range s.projects {
+	s.limits = make([]novaProjectLimits, len(s.projects))
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(e.GetAPIDetailConcurrencyCount())
+	for i, p := range s.projects {
 		limitGetOpts := limits.GetOpts{TenantID: p.ID}
 		if p.ID == e.TenantID {
 			limitGetOpts = limits.GetOpts{}
 		}
-
-		projectLimits, err := limits.Get(ctx, e.ClientV2, limitGetOpts).Extract()
-		if err != nil {
-			return err
-		}
-		s.limits = append(s.limits, novaProjectLimits{projectName: p.Name, projectID: p.ID, limits: *projectLimits})
+		g.Go(func() error {
+			projectLimits, err := limits.Get(gCtx, e.ClientV2, limitGetOpts).Extract()
+			if err != nil {
+				return err
+			}
+			s.limits[i] = novaProjectLimits{projectName: p.Name, projectID: p.ID, limits: *projectLimits}
+			return nil
+		})
 	}
-	return nil
+	return g.Wait()
 }
 
 func (e *NovaExporter) fetchQuotas(ctx context.Context, s *novaScrape) error {
-	s.quotas = make([]novaProjectQuotas, 0, len(s.projects))
-	for _, p := range s.projects {
-		quotaSet, err := quotasets.GetDetail(ctx, e.ClientV2, p.ID).Extract()
-		if err != nil {
-			return err
-		}
-		s.quotas = append(s.quotas, novaProjectQuotas{projectName: p.Name, projectID: p.ID, quotas: quotaSet})
+	s.quotas = make([]novaProjectQuotas, len(s.projects))
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(e.GetAPIDetailConcurrencyCount())
+	for i, p := range s.projects {
+		g.Go(func() error {
+			quotaSet, err := quotasets.GetDetail(gCtx, e.ClientV2, p.ID).Extract()
+			if err != nil {
+				return err
+			}
+			s.quotas[i] = novaProjectQuotas{projectName: p.Name, projectID: p.ID, quotas: quotaSet}
+			return nil
+		})
 	}
-	return nil
+	return g.Wait()
 }
 
 func (e *NovaExporter) fetchUsage(ctx context.Context, s *novaScrape) error {
