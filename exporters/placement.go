@@ -7,6 +7,7 @@ import (
 	gophercloudv2 "github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/openstack/placement/v1/resourceproviders"
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sync/errgroup"
 )
 
 func init() {
@@ -76,15 +77,15 @@ func (e *PlacementExporter) fetchProviders(ctx context.Context, s *placementScra
 }
 
 func (e *PlacementExporter) fetchInventories(ctx context.Context, s *placementScrape) error {
-	return fetchPlacementInventories(ctx, e.ClientV2, s)
+	return fetchPlacementInventories(ctx, e.ClientV2, s, e.GetPlacementConcurrencyCount())
 }
 
 func (e *PlacementExporter) fetchUsages(ctx context.Context, s *placementScrape) error {
-	return fetchPlacementUsages(ctx, e.ClientV2, s)
+	return fetchPlacementUsages(ctx, e.ClientV2, s, e.GetPlacementConcurrencyCount())
 }
 
 func (e *PlacementExporter) fetchAllocations(ctx context.Context, s *placementScrape) error {
-	return fetchPlacementAllocations(ctx, e.ClientV2, s)
+	return fetchPlacementAllocations(ctx, e.ClientV2, s, e.GetPlacementConcurrencyCount())
 }
 
 func (e *PlacementExporter) emitInventories(_ context.Context, s *placementScrape, ch chan<- prometheus.Metric) error {
@@ -114,40 +115,52 @@ func fetchPlacementProviders(ctx context.Context, client *gophercloudv2.ServiceC
 // The per-provider fetches below walk the providers one request at a time,
 // as the legacy collector did; a failed provider fails the whole source.
 
-func fetchPlacementInventories(ctx context.Context, client *gophercloudv2.ServiceClient, s *placementScrape) error {
-	s.inventories = make([]*resourceproviders.ResourceProviderInventories, len(s.providers))
+// fetchPerProvider runs get for every provider with at most limit requests
+// in flight and stores each result in the slot of its provider, so
+// concurrent goroutines never touch the same element.
+func fetchPerProvider[T any](ctx context.Context, s *placementScrape, limit int, get func(ctx context.Context, uuid string) (T, error)) ([]T, error) {
+	results := make([]T, len(s.providers))
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(limit)
 	for i := range s.providers {
-		result, err := resourceproviders.GetInventories(ctx, client, s.providers[i].UUID).Extract()
-		if err != nil {
-			return err
-		}
-		s.inventories[i] = result
+		uuid := s.providers[i].UUID
+		g.Go(func() error {
+			result, err := get(gCtx, uuid)
+			if err != nil {
+				return err
+			}
+			results[i] = result
+			return nil
+		})
 	}
-	return nil
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+	return results, nil
 }
 
-func fetchPlacementUsages(ctx context.Context, client *gophercloudv2.ServiceClient, s *placementScrape) error {
-	s.usages = make([]*resourceproviders.ResourceProviderUsage, len(s.providers))
-	for i := range s.providers {
-		result, err := resourceproviders.GetUsages(ctx, client, s.providers[i].UUID).Extract()
-		if err != nil {
-			return err
-		}
-		s.usages[i] = result
-	}
-	return nil
+func fetchPlacementInventories(ctx context.Context, client *gophercloudv2.ServiceClient, s *placementScrape, limit int) error {
+	var err error
+	s.inventories, err = fetchPerProvider(ctx, s, limit, func(ctx context.Context, uuid string) (*resourceproviders.ResourceProviderInventories, error) {
+		return resourceproviders.GetInventories(ctx, client, uuid).Extract()
+	})
+	return err
 }
 
-func fetchPlacementAllocations(ctx context.Context, client *gophercloudv2.ServiceClient, s *placementScrape) error {
-	s.allocations = make([]*resourceproviders.ResourceProviderAllocations, len(s.providers))
-	for i := range s.providers {
-		result, err := resourceproviders.GetAllocations(ctx, client, s.providers[i].UUID).Extract()
-		if err != nil {
-			return err
-		}
-		s.allocations[i] = result
-	}
-	return nil
+func fetchPlacementUsages(ctx context.Context, client *gophercloudv2.ServiceClient, s *placementScrape, limit int) error {
+	var err error
+	s.usages, err = fetchPerProvider(ctx, s, limit, func(ctx context.Context, uuid string) (*resourceproviders.ResourceProviderUsage, error) {
+		return resourceproviders.GetUsages(ctx, client, uuid).Extract()
+	})
+	return err
+}
+
+func fetchPlacementAllocations(ctx context.Context, client *gophercloudv2.ServiceClient, s *placementScrape, limit int) error {
+	var err error
+	s.allocations, err = fetchPerProvider(ctx, s, limit, func(ctx context.Context, uuid string) (*resourceproviders.ResourceProviderAllocations, error) {
+		return resourceproviders.GetAllocations(ctx, client, uuid).Extract()
+	})
+	return err
 }
 
 func emitPlacementInventories(descs *placementDescs, s *placementScrape, ch chan<- prometheus.Metric) {

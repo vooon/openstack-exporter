@@ -86,6 +86,14 @@ type ExporterOptions struct {
 	// DnsConcurrentCount bounds concurrent requests when collecting DNS
 	// recordsets.
 	DnsConcurrentCount int
+	// APIDetailConcurrentCount bounds concurrent per-resource detail requests
+	// (per-project limits and quotas, per-router L3 agents). Zero or negative
+	// selects the default.
+	APIDetailConcurrentCount int
+	// PlacementConcurrentCount bounds concurrent per-provider Placement
+	// requests (inventories, usages, allocations). Zero or negative selects
+	// the default.
+	PlacementConcurrentCount int
 	// UUIDGenFunc generates UUIDs for Cinder agents. Defaults to
 	// uuid.GenerateUUID when nil.
 	UUIDGenFunc func() (string, error)
@@ -145,6 +153,29 @@ func (exporter *BaseOpenStackExporter) Describe(ch chan<- *prometheus.Desc) {
 
 func (exporter *BaseOpenStackExporter) GetDnsConcurrencyCount() int {
 	return exporter.DnsConcurrentCount
+}
+
+const (
+	defaultAPIDetailConcurrency = 10
+	defaultPlacementConcurrency = 10
+)
+
+// GetAPIDetailConcurrencyCount returns the fan-out limit for per-resource
+// detail requests.
+func (exporter *BaseOpenStackExporter) GetAPIDetailConcurrencyCount() int {
+	if exporter.APIDetailConcurrentCount <= 0 {
+		return defaultAPIDetailConcurrency
+	}
+	return exporter.APIDetailConcurrentCount
+}
+
+// GetPlacementConcurrencyCount returns the fan-out limit for per-provider
+// Placement requests.
+func (exporter *BaseOpenStackExporter) GetPlacementConcurrencyCount() int {
+	if exporter.PlacementConcurrentCount <= 0 {
+		return defaultPlacementConcurrency
+	}
+	return exporter.PlacementConcurrentCount
 }
 
 // took from here:

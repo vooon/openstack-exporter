@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -182,8 +181,9 @@ func newPlacementBenchmarkFixture(b *testing.B, parallel bool) *placementBenchma
 		ClientV2:    client,
 		ServiceName: placementBenchmarkService,
 	}
-	setPlacementBenchmarkBoolField(config, "CompletePlacementInParallel", parallel)
-	setPlacementBenchmarkBoolField(config, "CollectPlacementTraits", false)
+	if !parallel {
+		config.PlacementConcurrentCount = 1
+	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	exporter, err := exporters.NewPlacementExporter(config, logger)
@@ -201,13 +201,6 @@ func placementBenchmarkParallelName(parallel bool) string {
 		return "parallel_enabled"
 	}
 	return "parallel_disabled"
-}
-
-func setPlacementBenchmarkBoolField(config *exporters.ExporterConfig, fieldName string, value bool) {
-	field := reflect.ValueOf(config).Elem().FieldByName(fieldName)
-	if field.IsValid() && field.CanSet() && field.Kind() == reflect.Bool {
-		field.SetBool(value)
-	}
 }
 
 func drainPlacementBenchmarkMetrics(ch <-chan prometheus.Metric) <-chan struct{} {
