@@ -56,6 +56,7 @@ var (
 	endpointType             = kingpin.Flag("endpoint-type", "openstack endpoint type to use (i.e: public, internal, admin)").Default("public").String()
 	collectTime              = kingpin.Flag("collect-metric-time", "time spent collecting each metric").Default("false").Bool()
 	disabledMetrics          = kingpin.Flag("disable-metric", "multiple --disable-metric can be specified in the format: service-metric (i.e: cinder-snapshots)").Default("").Short('d').Strings()
+	enabledMetrics           = kingpin.Flag("enable-metric", "keep a slow or deprecated metric enabled despite --disable-slow-metrics / --disable-deprecated-metrics; format: service-metric (i.e: nova-limits_vcpus_max)").Default("").Short('e').Strings()
 	disableSlowMetrics       = kingpin.Flag("disable-slow-metrics", "Disable slow metrics for performance reasons").Default("false").Bool()
 	disableDeprecatedMetrics = kingpin.Flag("disable-deprecated-metrics", "Disable deprecated metrics").Default("false").Bool()
 	disableCinderAgentUUID   = kingpin.Flag("disable-cinder-agent-uuid", "Disable UUID generation for Cinder agents").Default("false").Bool()
@@ -130,6 +131,7 @@ func main() {
 		Cloud:                    *cloud,
 		Prefix:                   *prefix,
 		DisabledMetrics:          *disabledMetrics,
+		EnabledMetrics:           *enabledMetrics,
 		EndpointType:             *endpointType,
 		CollectTime:              *collectTime,
 		DisableSlowMetrics:       *disableSlowMetrics,

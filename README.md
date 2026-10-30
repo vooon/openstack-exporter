@@ -108,6 +108,7 @@ Flags:
       --[no-]collect-metric-time
                                  time spent collecting each metric
   -d, --disable-metric= ...      multiple --disable-metric can be specified in the format: service-metric (i.e: cinder-snapshots)
+  -e, --enable-metric= ...       keep a slow or deprecated metric enabled despite --disable-slow-metrics / --disable-deprecated-metrics; format: service-metric (i.e: nova-limits_vcpus_max)
       --[no-]disable-slow-metrics
                                  Disable slow metrics for performance reasons
       --[no-]disable-deprecated-metrics
@@ -334,7 +335,9 @@ This fallback mechanism ensures that OpenStack-Exporter works correctly even whe
 
 There are some metrics that, depending on the cloud deployment size, can be slow to be
 collected because iteration over different projects is required. Those metrics are marked as `slow` and can be disabled with the command
-line parameter `--disable-slow-metrics`.
+line parameter `--disable-slow-metrics`. Individual slow or deprecated metrics can be kept with
+`--enable-metric <exporter>-<metric>` (for example `--enable-metric nova-limits_vcpus_max`);
+`--disable-metric` always wins over `--enable-metric`.
 
 Currently flagged as slow metrics are:
 
