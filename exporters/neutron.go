@@ -13,6 +13,7 @@ import (
 
 	"go4.org/netipx"
 
+	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/projects"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/agents"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/external"
 	"github.com/gophercloud/gophercloud/v2/openstack/networking/v2/extensions/layer3/floatingips"
@@ -35,6 +36,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+func init() {
+	RegisterTypedExporter("network", NewNeutronExporter)
+}
+
 var knownNetworkStatuses = map[string]int{
 	"ACTIVE": 0,
 	"BUILD":  1,
@@ -46,350 +51,333 @@ func mapNetworkStatus(current string) int {
 	return mapStatus(knownNetworkStatuses, current)
 }
 
-var vpn_service_status = []string{
-	"ACTIVE",
-	"DOWN",
-	"BUILD",
-	"ERROR",
-	"PENDING_CREATE",
-	"PENDING_UPDATE",
-	"PENDING_DELETE",
+var knownVpnStatuses = map[string]int{
+	"ACTIVE":         0,
+	"DOWN":           1,
+	"BUILD":          2,
+	"ERROR":          3,
+	"PENDING_CREATE": 4,
+	"PENDING_UPDATE": 5,
+	"PENDING_DELETE": 6,
 }
 
 func mapVpnServiceStatus(current string) int {
-	for idx, status := range vpn_service_status {
-		if current == status {
-			return idx
-		}
-	}
-	return -1
-}
-
-var vpn_connection_status = []string{
-	"ACTIVE",
-	"DOWN",
-	"BUILD",
-	"ERROR",
-	"PENDING_CREATE",
-	"PENDING_UPDATE",
-	"PENDING_DELETE",
+	return mapStatus(knownVpnStatuses, current)
 }
 
 func mapVpnConnectionStatus(current string) int {
-	for idx, status := range vpn_connection_status {
-		if current == status {
-			return idx
-		}
-	}
-	return -1
+	return mapStatus(knownVpnStatuses, current)
 }
 
 // NeutronExporter : extends BaseOpenStackExporter
 type NeutronExporter struct {
 	BaseOpenStackExporter
+	descs neutronDescs
+	sched Schedule[neutronScrape]
 }
 
-var (
-	defaultNeutronNetIPsLabels  = []string{"network_id", "network_name", "ip_version", "cidr", "subnet_name", "project_id"}
-	defaultNeutronSubnetsLabels = []string{"ip_version", "prefix", "prefix_length", "project_id", "subnet_pool_id", "subnet_pool_name"}
-	defaultNeutronQuotaLabels   = []string{"type", "tenant", "tenant_id"}
-)
+type neutronDescs struct {
+	FloatingIPs                    *prometheus.Desc `metric:"floating_ips"`
+	FloatingIPsAssociatedNotActive *prometheus.Desc `metric:"floating_ips_associated_not_active"`
+	FloatingIP                     *prometheus.Desc `metric:"floating_ip"                        labels:"id,floating_network_id,router_id,status,project_id,floating_ip_address"`
+	Networks                       *prometheus.Desc `metric:"networks"`
+	Network                        *prometheus.Desc `metric:"network"                            labels:"id,tenant_id,status,name,is_shared,is_external,provider_network_type,provider_physical_network,provider_segmentation_id,subnets,tags,mtu"`
+	SecurityGroups                 *prometheus.Desc `metric:"security_groups"`
+	Subnets                        *prometheus.Desc `metric:"subnets"`
+	Subnet                         *prometheus.Desc `metric:"subnet"                             labels:"id,tenant_id,name,network_id,cidr,gateway_ip,enable_dhcp,dns_nameservers,tags"`
+	Port                           *prometheus.Desc `metric:"port"                               labels:"uuid,network_id,mac_address,device_owner,device_id,status,binding_vif_type,admin_state_up,fixed_ips"`
+	Ports                          *prometheus.Desc `metric:"ports"`
+	PortsNoIPs                     *prometheus.Desc `metric:"ports_no_ips"`
+	PortsLBNotActive               *prometheus.Desc `metric:"ports_lb_not_active"`
+	Router                         *prometheus.Desc `metric:"router"                             labels:"id,name,project_id,admin_state_up,status,external_network_id"`
+	Routers                        *prometheus.Desc `metric:"routers"`
+	VpnEndpointGroups              *prometheus.Desc `metric:"vpn_endpoint_groups"`
+	VpnIKEPolicies                 *prometheus.Desc `metric:"vpn_ike_policies"`
+	VpnIPsecPolicies               *prometheus.Desc `metric:"vpn_ipsec_policies"`
+	VpnServices                    *prometheus.Desc `metric:"vpn_services"`
+	VpnService                     *prometheus.Desc `metric:"vpn_service"                        labels:"id,project_id,subnet_id,router_id,admin_state_up,name,external_ipv4,external_ipv6,flavor_id"`
+	VpnSiteConnections             *prometheus.Desc `metric:"vpn_siteconnections"`
+	VpnSiteConnection              *prometheus.Desc `metric:"vpn_siteconnection"                 labels:"id,project_id,admin_state_up,name,vpn_service_id,ike_policy_id,ipsec_policy_id,peer_id,peer_ep_group_id,local_id,local_ep_group_id"`
+	RoutersNotActive               *prometheus.Desc `metric:"routers_not_active"`
+	L3AgentOfRouter                *prometheus.Desc `metric:"l3_agent_of_router"                 labels:"router_id,l3_agent_id,ha_state,agent_alive,agent_admin_up,agent_host"`
+	AgentState                     *prometheus.Desc `metric:"agent_state"                        labels:"id,hostname,service,adminState,availability_zone"`
+	NetworkIPAvailabilitiesTotal   *prometheus.Desc `metric:"network_ip_availabilities_total"    labels:"network_id,network_name,ip_version,cidr,subnet_name,project_id"`
+	NetworkIPAvailabilitiesUsed    *prometheus.Desc `metric:"network_ip_availabilities_used"     labels:"network_id,network_name,ip_version,cidr,subnet_name,project_id"`
+	SubnetsTotal                   *prometheus.Desc `metric:"subnets_total"                      labels:"ip_version,prefix,prefix_length,project_id,subnet_pool_id,subnet_pool_name"`
+	SubnetsUsed                    *prometheus.Desc `metric:"subnets_used"                       labels:"ip_version,prefix,prefix_length,project_id,subnet_pool_id,subnet_pool_name"`
+	SubnetsFree                    *prometheus.Desc `metric:"subnets_free"                       labels:"ip_version,prefix,prefix_length,project_id,subnet_pool_id,subnet_pool_name"`
+	QuotaNetwork                   *prometheus.Desc `metric:"quota_network"                      labels:"type,tenant,tenant_id" slow:"true"`
+	QuotaSubnet                    *prometheus.Desc `metric:"quota_subnet"                       labels:"type,tenant,tenant_id" slow:"true"`
+	QuotaSubnetPool                *prometheus.Desc `metric:"quota_subnetpool"                   labels:"type,tenant,tenant_id" slow:"true"`
+	QuotaPort                      *prometheus.Desc `metric:"quota_port"                         labels:"type,tenant,tenant_id" slow:"true"`
+	QuotaRouter                    *prometheus.Desc `metric:"quota_router"                       labels:"type,tenant,tenant_id" slow:"true"`
+	QuotaFloatingIP                *prometheus.Desc `metric:"quota_floatingip"                   labels:"type,tenant,tenant_id" slow:"true"`
+	QuotaSecurityGroup             *prometheus.Desc `metric:"quota_security_group"               labels:"type,tenant,tenant_id" slow:"true"`
+	QuotaSecurityGroupRule         *prometheus.Desc `metric:"quota_security_group_rule"          labels:"type,tenant,tenant_id" slow:"true"`
+	QuotaRBACPolicy                *prometheus.Desc `metric:"quota_rbac_policy"                  labels:"type,tenant,tenant_id" slow:"true"`
+}
 
-var defaultNeutronMetrics = []Metric{
-	{Name: "floating_ips", Fn: ListFloatingIps},
-	{Name: "floating_ips_associated_not_active"},
-	{Name: "floating_ip", Labels: []string{"id", "floating_network_id", "router_id", "status", "project_id", "floating_ip_address"}},
-	{Name: "networks", Fn: ListNetworks},
-	{Name: "network", Labels: []string{"id", "tenant_id", "status", "name", "is_shared", "is_external", "provider_network_type",
-		"provider_physical_network", "provider_segmentation_id", "subnets", "tags", "mtu"}},
-	{Name: "security_groups", Fn: ListSecGroups},
-	{Name: "subnets", Fn: ListSubnets},
-	{Name: "subnet", Labels: []string{"id", "tenant_id", "name", "network_id", "cidr", "gateway_ip", "enable_dhcp", "dns_nameservers", "tags"}},
-	{Name: "port", Labels: []string{"uuid", "network_id", "mac_address", "device_owner", "device_id", "status", "binding_vif_type", "admin_state_up", "fixed_ips"}, Fn: ListPorts},
-	{Name: "ports"},
-	{Name: "ports_no_ips"},
-	{Name: "ports_lb_not_active"},
-	{Name: "router", Labels: []string{"id", "name", "project_id", "admin_state_up", "status", "external_network_id"}},
-	{Name: "routers", Fn: ListRouters},
-	{Name: "vpn_endpoint_groups", Fn: ListVpnEndpointGroups},
-	{Name: "vpn_ike_policies", Fn: ListIkePolicies},
-	{Name: "vpn_ipsec_policies", Fn: ListIpsecPolicies},
-	{Name: "vpn_services", Fn: ListVpnServices},
-	{Name: "vpn_service", Labels: []string{"id", "project_id", "subnet_id", "router_id", "admin_state_up", "name", "external_ipv4", "external_ipv6", "flavor_id"}},
-	{Name: "vpn_siteconnections", Fn: ListVpnSiteConnections},
-	{Name: "vpn_siteconnection", Labels: []string{"id", "project_id", "admin_state_up", "name", "vpn_service_id", "ike_policy_id", "ipsec_policy_id", "peer_id", "peer_ep_group_id", "local_id", "local_ep_group_id"}},
-	{Name: "routers_not_active"},
-	{Name: "l3_agent_of_router", Labels: []string{"router_id", "l3_agent_id", "ha_state", "agent_alive", "agent_admin_up", "agent_host"}},
-	{Name: "agent_state", Labels: []string{"id", "hostname", "service", "adminState", "availability_zone"}, Fn: ListAgentStates},
-	{Name: "network_ip_availabilities_total", Labels: defaultNeutronNetIPsLabels, Fn: ListNetworkIPAvailabilities},
-	{Name: "network_ip_availabilities_used", Labels: defaultNeutronNetIPsLabels},
-	{Name: "subnets_total", Labels: defaultNeutronSubnetsLabels, Fn: ListSubnetsPerPool},
-	{Name: "subnets_used", Labels: defaultNeutronSubnetsLabels},
-	{Name: "subnets_free", Labels: defaultNeutronSubnetsLabels},
-	{Name: "quota_network", Labels: defaultNeutronQuotaLabels, Fn: ListNetworkQuotas, Slow: true},
-	{Name: "quota_subnet", Labels: defaultNeutronQuotaLabels, Fn: nil, Slow: true},
-	{Name: "quota_subnetpool", Labels: defaultNeutronQuotaLabels, Fn: nil, Slow: true},
-	{Name: "quota_port", Labels: defaultNeutronQuotaLabels, Fn: nil, Slow: true},
-	{Name: "quota_router", Labels: defaultNeutronQuotaLabels, Fn: nil, Slow: true},
-	{Name: "quota_floatingip", Labels: defaultNeutronQuotaLabels, Fn: nil, Slow: true},
-	{Name: "quota_security_group", Labels: defaultNeutronQuotaLabels, Fn: nil, Slow: true},
-	{Name: "quota_security_group_rule", Labels: defaultNeutronQuotaLabels, Fn: nil, Slow: true},
-	{Name: "quota_rbac_policy", Labels: defaultNeutronQuotaLabels, Fn: nil, Slow: true},
+// neutronNetworkExt : networks.Network with the external, provider and MTU extensions
+type neutronNetworkExt struct {
+	networks.Network
+	external.NetworkExternalExt
+	provider.NetworkProviderExt
+	mtu.NetworkMTUExt
+}
+
+// neutronPortExt : ports.Port with the port binding extension
+type neutronPortExt struct {
+	ports.Port
+	portsbinding.PortsBindingExt
+}
+
+// neutronNetIPAvail : one network from network-ip-availabilities, with the
+// per-subnet counters already parsed from their JSON numbers
+type neutronNetIPAvail struct {
+	NetworkID   string
+	NetworkName string
+	ProjectID   string
+	Subnets     []neutronSubnetIPAvail
+}
+
+type neutronSubnetIPAvail struct {
+	SubnetName string
+	CIDR       string
+	IPVersion  int
+	TotalIPs   float64
+	UsedIPs    float64
+}
+
+// neutronProjectQuota : quota detail of one project, with the project name
+// the metric labels need
+type neutronProjectQuota struct {
+	projectName string
+	projectID   string
+	quota       quotas.QuotaDetailSet
+}
+
+type neutronScrape struct {
+	floatingIPs         []floatingips.FloatingIP
+	networks            []neutronNetworkExt
+	securityGroups      []groups.SecGroup
+	subnets             []subnets.Subnet
+	ports               []neutronPortExt
+	routers             []routers.Router
+	ovnBackend          bool
+	routerL3Agents      map[string][]routers.L3Agent
+	vpnEndpointGroups   []endpointgroups.EndpointGroup
+	vpnIKEPolicies      []ikepolicies.Policy
+	vpnIPsecPolicies    []ipsecpolicies.Policy
+	vpnServices         []services.Service
+	vpnSiteConnections  []siteconnections.Connection
+	agents              []agents.Agent
+	netIPAvailabilities []neutronNetIPAvail
+	subnetPools         []subnetpools.SubnetPool
+	projects            []projects.Project
+	quotas              []neutronProjectQuota
 }
 
 // NewNeutronExporter : returns a pointer to NeutronExporter
 func NewNeutronExporter(config *ExporterConfig, logger *slog.Logger) (*NeutronExporter, error) {
-	exporter := NeutronExporter{
-		BaseOpenStackExporter{
+	e := &NeutronExporter{
+		BaseOpenStackExporter: BaseOpenStackExporter{
 			Name:           "neutron",
 			ExporterConfig: *config,
 			logger:         logger,
 		},
 	}
-
-	for _, metric := range defaultNeutronMetrics {
-		if exporter.isDeprecatedMetric(&metric) {
-			continue
-		}
-		if !exporter.isSlowMetric(&metric) {
-			exporter.AddMetric(metric.Name, metric.Fn, metric.Labels, metric.DeprecatedVersion, nil)
-		}
+	graph := Graph[neutronScrape]{
+		Sources: []Source[neutronScrape]{
+			{Name: "floatingips", Fetch: e.fetchFloatingIPs},
+			{Name: "networks", Fetch: e.fetchNetworks},
+			{Name: "secgroups", Fetch: e.fetchSecGroups},
+			{Name: "subnets", Fetch: e.fetchSubnets},
+			{Name: "ports", Fetch: e.fetchPorts},
+			{Name: "routers", Fetch: e.fetchRouters},
+			{Name: "router_l3_agents", DependsOn: []string{"routers"}, Fetch: e.fetchRouterL3Agents},
+			{Name: "vpn_endpoint_groups", Fetch: e.fetchVpnEndpointGroups},
+			{Name: "vpn_ike_policies", Fetch: e.fetchVpnIKEPolicies},
+			{Name: "vpn_ipsec_policies", Fetch: e.fetchVpnIPsecPolicies},
+			{Name: "vpn_services", Fetch: e.fetchVpnServices},
+			{Name: "vpn_siteconnections", Fetch: e.fetchVpnSiteConnections},
+			{Name: "agents", Fetch: e.fetchAgents},
+			{Name: "net_ip_avail", Fetch: e.fetchNetIPAvail},
+			{Name: "subnet_pools", Fetch: e.fetchSubnetPools},
+			{Name: "projects", Fetch: e.fetchProjects},
+			{Name: "quotas", DependsOn: []string{"projects"}, Fetch: e.fetchQuotas},
+		},
+		Emitters: []Emitter[neutronScrape]{
+			{Name: "floatingips", Metrics: []string{"floating_ips", "floating_ips_associated_not_active", "floating_ip"}, Sources: []string{"floatingips"}, Emit: e.emitFloatingIPs},
+			{Name: "networks", Metrics: []string{"networks", "network"}, Sources: []string{"networks"}, Emit: e.emitNetworks},
+			{Name: "secgroups", Metrics: []string{"security_groups"}, Sources: []string{"secgroups"}, Emit: e.emitSecGroups},
+			{Name: "subnets", Metrics: []string{"subnets", "subnet"}, Sources: []string{"subnets"}, Emit: e.emitSubnets},
+			{Name: "ports", Metrics: []string{"port", "ports", "ports_no_ips", "ports_lb_not_active"}, Sources: []string{"ports"}, Emit: e.emitPorts},
+			{Name: "routers", Metrics: []string{"router", "routers", "routers_not_active"}, Sources: []string{"routers"}, Emit: e.emitRouters},
+			{Name: "router_l3_agents", Metrics: []string{"l3_agent_of_router"}, Sources: []string{"router_l3_agents"}, Emit: e.emitRouterL3Agents},
+			{Name: "vpn_endpoint_groups", Metrics: []string{"vpn_endpoint_groups"}, Sources: []string{"vpn_endpoint_groups"}, Emit: e.emitVpnEndpointGroups},
+			{Name: "vpn_ike_policies", Metrics: []string{"vpn_ike_policies"}, Sources: []string{"vpn_ike_policies"}, Emit: e.emitVpnIKEPolicies},
+			{Name: "vpn_ipsec_policies", Metrics: []string{"vpn_ipsec_policies"}, Sources: []string{"vpn_ipsec_policies"}, Emit: e.emitVpnIPsecPolicies},
+			{Name: "vpn_services", Metrics: []string{"vpn_services", "vpn_service"}, Sources: []string{"vpn_services"}, Emit: e.emitVpnServices},
+			{Name: "vpn_siteconnections", Metrics: []string{"vpn_siteconnections", "vpn_siteconnection"}, Sources: []string{"vpn_siteconnections"}, Emit: e.emitVpnSiteConnections},
+			{Name: "agents", Metrics: []string{"agent_state"}, Sources: []string{"agents"}, Emit: e.emitAgents},
+			{Name: "net_ip_avail", Metrics: []string{"network_ip_availabilities_total", "network_ip_availabilities_used"}, Sources: []string{"net_ip_avail"}, Emit: e.emitNetIPAvail},
+			{Name: "subnet_pools", Metrics: []string{"subnets_total", "subnets_used", "subnets_free"}, Sources: []string{"subnet_pools", "subnets"}, Emit: e.emitSubnetPools},
+			{Name: "quotas", Metrics: []string{"quota_network", "quota_subnet", "quota_subnetpool", "quota_port", "quota_router", "quota_floatingip", "quota_security_group", "quota_security_group_rule", "quota_rbac_policy"}, Sources: []string{"quotas"}, Emit: e.emitQuotas},
+		},
 	}
-
-	return &exporter, nil
+	sched, err := SetupExporter(&e.BaseOpenStackExporter, &e.descs, &graph)
+	if err != nil {
+		return nil, err
+	}
+	e.sched = sched
+	return e, nil
 }
 
-// ListFloatingIps : count total number of instantiated FloatingIPs and those that are associated to private IP but not in ACTIVE state
-func ListFloatingIps(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	var allFloatingIPs []floatingips.FloatingIP
+func (e *NeutronExporter) Collect(ch chan<- prometheus.Metric) {
+	CollectSchedule(&e.BaseOpenStackExporter, &e.sched, new(neutronScrape), ch)
+}
 
-	allPagesFloatingIPs, err := floatingips.List(exporter.ClientV2, floatingips.ListOpts{}).AllPages(ctx)
+// --- Sources ---
+
+func (e *NeutronExporter) fetchFloatingIPs(ctx context.Context, s *neutronScrape) error {
+	allPages, err := floatingips.List(e.ClientV2, floatingips.ListOpts{}).AllPages(ctx)
 	if err != nil {
 		return err
 	}
+	s.floatingIPs, err = floatingips.ExtractFloatingIPs(allPages)
+	return err
+}
 
-	allFloatingIPs, err = floatingips.ExtractFloatingIPs(allPagesFloatingIPs)
+func (e *NeutronExporter) fetchNetworks(ctx context.Context, s *neutronScrape) error {
+	allPages, err := networks.List(e.ClientV2, networks.ListOpts{}).AllPages(ctx)
 	if err != nil {
 		return err
 	}
+	return networks.ExtractNetworksInto(allPages, &s.networks)
+}
 
-	failedFIPs := 0
-	for _, fip := range allFloatingIPs {
-		ch <- prometheus.MustNewConstMetric(exporter.Metrics["floating_ip"].Metric,
-			prometheus.GaugeValue, 1, fip.ID, fip.FloatingNetworkID, fip.RouterID, fip.Status, fip.ProjectID, fip.FloatingIP)
+func (e *NeutronExporter) fetchSecGroups(ctx context.Context, s *neutronScrape) error {
+	allPages, err := groups.List(e.ClientV2, groups.ListOpts{}).AllPages(ctx)
+	if err != nil {
+		return err
+	}
+	s.securityGroups, err = groups.ExtractGroups(allPages)
+	return err
+}
 
-		if fip.FixedIP != "" && fip.Status != "ACTIVE" {
-			failedFIPs = failedFIPs + 1
+func (e *NeutronExporter) fetchSubnets(ctx context.Context, s *neutronScrape) error {
+	allPages, err := subnets.List(e.ClientV2, subnets.ListOpts{}).AllPages(ctx)
+	if err != nil {
+		return err
+	}
+	s.subnets, err = subnets.ExtractSubnets(allPages)
+	return err
+}
+
+func (e *NeutronExporter) fetchPorts(ctx context.Context, s *neutronScrape) error {
+	allPages, err := ports.List(e.ClientV2, ports.ListOpts{}).AllPages(ctx)
+	if err != nil {
+		return err
+	}
+	return ports.ExtractPortsInto(allPages, &s.ports)
+}
+
+func (e *NeutronExporter) fetchRouters(ctx context.Context, s *neutronScrape) error {
+	allPages, err := routers.List(e.ClientV2, routers.ListOpts{}).AllPages(ctx)
+	if err != nil {
+		return err
+	}
+	s.routers, err = routers.ExtractRouters(allPages)
+	return err
+}
+
+// fetchRouterL3Agents lists the L3 agents hosting each router, one request
+// per router. Neutron with the OVN backend has no router L3 agents, which is
+// detected by the presence of ovn-controller agents; then nothing is fetched.
+func (e *NeutronExporter) fetchRouterL3Agents(ctx context.Context, s *neutronScrape) error {
+	ovnPages, err := agents.List(e.ClientV2, agents.ListOpts{Binary: "ovn-controller"}).AllPages(ctx)
+	if err != nil {
+		return err
+	}
+	ovnAgents, err := agents.ExtractAgents(ovnPages)
+	if err != nil {
+		return err
+	}
+	s.ovnBackend = len(ovnAgents) > 0
+	if s.ovnBackend {
+		return nil
+	}
+
+	s.routerL3Agents = make(map[string][]routers.L3Agent, len(s.routers))
+	for _, router := range s.routers {
+		allPages, err := routers.ListL3Agents(e.ClientV2, router.ID).AllPages(ctx)
+		if err != nil {
+			return err
 		}
+		l3Agents, err := routers.ExtractL3Agents(allPages)
+		if err != nil {
+			return err
+		}
+		s.routerL3Agents[router.ID] = l3Agents
 	}
-
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["floating_ips"].Metric,
-		prometheus.GaugeValue, float64(len(allFloatingIPs)))
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["floating_ips_associated_not_active"].Metric,
-		prometheus.GaugeValue, float64(failedFIPs))
-
 	return nil
 }
 
-// ListAgentStates : list agent state per node
-func ListAgentStates(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	var allAgents []agents.Agent
-
-	allPagesAgents, err := agents.List(exporter.ClientV2, agents.ListOpts{}).AllPages(ctx)
+func (e *NeutronExporter) fetchVpnEndpointGroups(ctx context.Context, s *neutronScrape) error {
+	allPages, err := endpointgroups.List(e.ClientV2, endpointgroups.ListOpts{}).AllPages(ctx)
 	if err != nil {
 		return err
 	}
-
-	allAgents, err = agents.ExtractAgents(allPagesAgents)
-	if err != nil {
-		return err
-	}
-
-	for _, agent := range allAgents {
-		var state = 0
-		var id string
-		var zone string
-
-		if agent.Alive {
-			state = 1
-		}
-
-		adminState := "down"
-		if agent.AdminStateUp {
-			adminState = "up"
-		}
-
-		id = agent.ID
-		if id == "" {
-			if id, err = exporter.UUIDGenFunc(); err != nil {
-				return err
-			}
-		}
-
-		zone = agent.AvailabilityZone
-
-		ch <- prometheus.MustNewConstMetric(exporter.Metrics["agent_state"].Metric,
-			prometheus.GaugeValue, float64(state), id, agent.Host, agent.Binary, adminState, zone)
-	}
-
-	return nil
+	s.vpnEndpointGroups, err = endpointgroups.ExtractEndpointGroups(allPages)
+	return err
 }
 
-// ListNetworks : Count total number of instantiated Networks and list each Network info
-func ListNetworks(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	type NetworkWithExt struct {
-		networks.Network
-		external.NetworkExternalExt
-		provider.NetworkProviderExt
-		mtu.NetworkMTUExt
-	}
-
-	var allNetworks []NetworkWithExt
-
-	allPagesNetworks, err := networks.List(exporter.ClientV2, networks.ListOpts{}).AllPages(ctx)
+func (e *NeutronExporter) fetchVpnIKEPolicies(ctx context.Context, s *neutronScrape) error {
+	allPages, err := ikepolicies.List(e.ClientV2, ikepolicies.ListOpts{}).AllPages(ctx)
 	if err != nil {
 		return err
 	}
-
-	err = networks.ExtractNetworksInto(allPagesNetworks, &allNetworks)
-	if err != nil {
-		return err
-	}
-
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["networks"].Metric,
-		prometheus.GaugeValue, float64(len(allNetworks)))
-
-	if !exporter.MetricIsDisabled("network") {
-		for _, net := range allNetworks {
-			ch <- prometheus.MustNewConstMetric(exporter.Metrics["network"].Metric,
-				prometheus.GaugeValue, float64(mapNetworkStatus(net.Status)), net.ID, net.TenantID, net.Status, net.Name,
-				strconv.FormatBool(net.Shared), strconv.FormatBool(net.External), net.NetworkType,
-				net.PhysicalNetwork, net.SegmentationID, strings.Join(net.Subnets, ","), strings.Join(net.Tags, ","), strconv.Itoa(net.MTU))
-		}
-	}
-
-	return nil
+	s.vpnIKEPolicies, err = ikepolicies.ExtractPolicies(allPages)
+	return err
 }
 
-// ListSecGroups : count total number of instantiated Security Groups
-func ListSecGroups(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	var allSecurityGroups []groups.SecGroup
-
-	allPagesSecurityGroups, err := groups.List(exporter.ClientV2, groups.ListOpts{}).AllPages(ctx)
+func (e *NeutronExporter) fetchVpnIPsecPolicies(ctx context.Context, s *neutronScrape) error {
+	allPages, err := ipsecpolicies.List(e.ClientV2, ipsecpolicies.ListOpts{}).AllPages(ctx)
 	if err != nil {
 		return err
 	}
-
-	allSecurityGroups, err = groups.ExtractGroups(allPagesSecurityGroups)
-	if err != nil {
-		return err
-	}
-
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["security_groups"].Metric,
-		prometheus.GaugeValue, float64(len(allSecurityGroups)))
-
-	return nil
+	s.vpnIPsecPolicies, err = ipsecpolicies.ExtractPolicies(allPages)
+	return err
 }
 
-// ListSubnets : count total number of instantiated Subnets and list each Subnet info
-func ListSubnets(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	var allSubnets []subnets.Subnet
-
-	allPagesSubnets, err := subnets.List(exporter.ClientV2, subnets.ListOpts{}).AllPages(ctx)
+func (e *NeutronExporter) fetchVpnServices(ctx context.Context, s *neutronScrape) error {
+	allPages, err := services.List(e.ClientV2, services.ListOpts{}).AllPages(ctx)
 	if err != nil {
 		return err
 	}
-
-	allSubnets, err = subnets.ExtractSubnets(allPagesSubnets)
-	if err != nil {
-		return err
-	}
-
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["subnets"].Metric,
-		prometheus.GaugeValue, float64(len(allSubnets)))
-
-	if !exporter.MetricIsDisabled("subnet") {
-		for _, subnet := range allSubnets {
-			ch <- prometheus.MustNewConstMetric(exporter.Metrics["subnet"].Metric,
-				prometheus.GaugeValue, 1.0, subnet.ID, subnet.TenantID, subnet.Name, subnet.NetworkID, subnet.CIDR,
-				subnet.GatewayIP, strconv.FormatBool(subnet.EnableDHCP), strings.Join(subnet.DNSNameservers, ","), strings.Join(subnet.Tags, ","))
-		}
-	}
-
-	return nil
+	s.vpnServices, err = services.ExtractServices(allPages)
+	return err
 }
 
-// ListPorts generates metrics about ports inside the OpenStack cloud
-func ListPorts(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	type PortBinding struct {
-		ports.Port
-		portsbinding.PortsBindingExt
-	}
-
-	var allPorts []PortBinding
-
-	allPagesPorts, err := ports.List(exporter.ClientV2, ports.ListOpts{}).AllPages(ctx)
+func (e *NeutronExporter) fetchVpnSiteConnections(ctx context.Context, s *neutronScrape) error {
+	allPages, err := siteconnections.List(e.ClientV2, siteconnections.ListOpts{}).AllPages(ctx)
 	if err != nil {
 		return err
 	}
-
-	err = ports.ExtractPortsInto(allPagesPorts, &allPorts)
-	if err != nil {
-		return err
-	}
-
-	portsWithNoIP := float64(0)
-	lbaasPortsInactive := float64(0)
-
-	for _, port := range allPorts {
-		if port.Status == "ACTIVE" && len(port.FixedIPs) == 0 {
-			portsWithNoIP++
-		}
-
-		if port.DeviceOwner == "neutron:LOADBALANCERV2" && port.Status != "ACTIVE" {
-			lbaasPortsInactive++
-		}
-
-		if !exporter.MetricIsDisabled("port") {
-			var fixedIPs = ""
-
-			portFixedIPsLen := len(port.FixedIPs)
-			if portFixedIPsLen == 1 {
-				fixedIPs = port.FixedIPs[0].IPAddress
-			} else if portFixedIPsLen > 1 {
-				for idx, fip := range port.FixedIPs {
-					// Joining IPs into a string with ',' separator
-					if idx != 0 {
-						fixedIPs += ","
-					}
-					fixedIPs += fip.IPAddress
-				}
-			}
-
-			ch <- prometheus.MustNewConstMetric(exporter.Metrics["port"].Metric,
-				prometheus.GaugeValue, 1, port.ID, port.NetworkID, port.MACAddress, port.DeviceOwner, port.DeviceID,
-				port.Status, port.VIFType, strconv.FormatBool(port.AdminStateUp), fixedIPs)
-		}
-	}
-
-	// NOTE(mnaser): We should deprecate this and users can replace it by
-	//               count(openstack_neutron_port)
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["ports"].Metric,
-		prometheus.GaugeValue, float64(len(allPorts)))
-
-	// NOTE(mnaser): We should deprecate this and users can replace it by:
-	//               count(openstack_neutron_port{device_owner="neutron:LOADBALANCERV2",status!="ACTIVE"})
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["ports_lb_not_active"].Metric,
-		prometheus.GaugeValue, lbaasPortsInactive)
-
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["ports_no_ips"].Metric,
-		prometheus.GaugeValue, portsWithNoIP)
-
-	return nil
+	s.vpnSiteConnections, err = siteconnections.ExtractConnections(allPages)
+	return err
 }
 
-// ListNetworkIPAvailabilities : count total number of used IPs per Network
-func ListNetworkIPAvailabilities(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
+func (e *NeutronExporter) fetchAgents(ctx context.Context, s *neutronScrape) error {
+	allPages, err := agents.List(e.ClientV2, agents.ListOpts{}).AllPages(ctx)
+	if err != nil {
+		return err
+	}
+	s.agents, err = agents.ExtractAgents(allPages)
+	return err
+}
+
+func (e *NeutronExporter) fetchNetIPAvail(ctx context.Context, s *neutronScrape) error {
 	type customSubnetIPAvailability struct {
 		SubnetName string      `json:"subnet_name"`
 		CIDR       string      `json:"cidr"`
@@ -410,13 +398,13 @@ func ListNetworkIPAvailabilities(ctx context.Context, exporter *BaseOpenStackExp
 		NetworkIPAvailabilities []customNetworkIPAvailability `json:"network_ip_availabilities"`
 	}
 
-	allPagesNetworkIPAvailabilities, err := networkipavailabilities.List(exporter.ClientV2, networkipavailabilities.ListOpts{}).AllPages(ctx)
+	allPages, err := networkipavailabilities.List(e.ClientV2, networkipavailabilities.ListOpts{}).AllPages(ctx)
 	if err != nil {
 		return err
 	}
 
 	// Decode raw JSON manually to avoid gophercloud unmarshaling big.Int error
-	body := allPagesNetworkIPAvailabilities.GetBody()
+	body := allPages.GetBody()
 	bodyMap, ok := body.(map[string]interface{})
 	if !ok {
 		return fmt.Errorf("unexpected type for body: %T", body)
@@ -438,223 +426,324 @@ func ListNetworkIPAvailabilities(ctx context.Context, exporter *BaseOpenStackExp
 			projectID = network.TenantID
 		}
 
+		entry := neutronNetIPAvail{NetworkID: network.NetworkID, NetworkName: network.NetworkName, ProjectID: projectID}
 		for _, subnet := range network.SubnetIPAvailabilities {
 			// Use big.Float to parse TotalIPs
 			totalBig := new(big.Float)
-			_, ok := totalBig.SetString(subnet.TotalIPs.String())
-			if !ok {
+			if _, ok := totalBig.SetString(subnet.TotalIPs.String()); !ok {
 				return fmt.Errorf("failed to parse total IPs: %s", subnet.TotalIPs.String())
 			}
 			totalFloat64, _ := totalBig.Float64()
 
 			usedBig := new(big.Float)
-			_, ok = usedBig.SetString(subnet.UsedIPs.String())
-			if !ok {
+			if _, ok := usedBig.SetString(subnet.UsedIPs.String()); !ok {
 				return fmt.Errorf("failed to parse used IPs: %s", subnet.UsedIPs.String())
 			}
 			usedFloat64, _ := usedBig.Float64()
 
-			ch <- prometheus.MustNewConstMetric(exporter.Metrics["network_ip_availabilities_total"].Metric,
-				prometheus.GaugeValue, totalFloat64, network.NetworkID,
-				network.NetworkName, strconv.Itoa(subnet.IPVersion), subnet.CIDR,
-				subnet.SubnetName, projectID)
+			entry.Subnets = append(entry.Subnets, neutronSubnetIPAvail{
+				SubnetName: subnet.SubnetName,
+				CIDR:       subnet.CIDR,
+				IPVersion:  subnet.IPVersion,
+				TotalIPs:   totalFloat64,
+				UsedIPs:    usedFloat64,
+			})
+		}
+		s.netIPAvailabilities = append(s.netIPAvailabilities, entry)
+	}
+	return nil
+}
 
-			ch <- prometheus.MustNewConstMetric(exporter.Metrics["network_ip_availabilities_used"].Metric,
-				prometheus.GaugeValue, usedFloat64, network.NetworkID,
-				network.NetworkName, strconv.Itoa(subnet.IPVersion), subnet.CIDR,
-				subnet.SubnetName, projectID)
+func (e *NeutronExporter) fetchSubnetPools(ctx context.Context, s *neutronScrape) error {
+	allPages, err := subnetpools.List(e.ClientV2, subnetpools.ListOpts{}).AllPages(ctx)
+	if err != nil {
+		return err
+	}
+	s.subnetPools, err = subnetpools.ExtractSubnetPools(allPages)
+	return err
+}
+
+func (e *NeutronExporter) fetchProjects(ctx context.Context, s *neutronScrape) error {
+	var err error
+	s.projects, err = GetProjects(ctx, &e.BaseOpenStackExporter)
+	return err
+}
+
+// fetchQuotas reads the quota detail of every project, one request per
+// project, from the neutron API.
+func (e *NeutronExporter) fetchQuotas(ctx context.Context, s *neutronScrape) error {
+	s.quotas = make([]neutronProjectQuota, 0, len(s.projects))
+	for _, p := range s.projects {
+		quota, err := quotas.GetDetail(ctx, e.ClientV2, p.ID).Extract()
+		if err != nil {
+			return err
+		}
+		s.quotas = append(s.quotas, neutronProjectQuota{projectName: p.Name, projectID: p.ID, quota: *quota})
+	}
+	return nil
+}
+
+// --- Emitters ---
+
+func (e *NeutronExporter) emitFloatingIPs(_ context.Context, s *neutronScrape, ch chan<- prometheus.Metric) error {
+	failedFIPs := 0
+	for i := range s.floatingIPs {
+		fip := &s.floatingIPs[i]
+		emitGauge(ch, e.descs.FloatingIP, 1, fip.ID, fip.FloatingNetworkID, fip.RouterID, fip.Status, fip.ProjectID, fip.FloatingIP)
+
+		if fip.FixedIP != "" && fip.Status != "ACTIVE" {
+			failedFIPs++
 		}
 	}
 
+	emitGauge(ch, e.descs.FloatingIPs, float64(len(s.floatingIPs)))
+	emitGauge(ch, e.descs.FloatingIPsAssociatedNotActive, float64(failedFIPs))
 	return nil
 }
 
-// ListVpnEndpointGroups : count total number of vpn endpoint groups instantiated
-func ListVpnEndpointGroups(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	var allEndpointGroups []endpointgroups.EndpointGroup
-
-	allPagesEndpointGroups, err := endpointgroups.List(exporter.ClientV2, endpointgroups.ListOpts{}).AllPages(ctx)
-	if err != nil {
-		return err
+func (e *NeutronExporter) emitNetworks(_ context.Context, s *neutronScrape, ch chan<- prometheus.Metric) error {
+	emitGauge(ch, e.descs.Networks, float64(len(s.networks)))
+	for i := range s.networks {
+		net := &s.networks[i]
+		emitGauge(ch, e.descs.Network, float64(mapNetworkStatus(net.Status)), net.ID, net.TenantID, net.Status, net.Name,
+			strconv.FormatBool(net.Shared), strconv.FormatBool(net.External), net.NetworkType,
+			net.PhysicalNetwork, net.SegmentationID, strings.Join(net.Subnets, ","), strings.Join(net.Tags, ","), strconv.Itoa(net.MTU))
 	}
-
-	allEndpointGroups, err = endpointgroups.ExtractEndpointGroups(allPagesEndpointGroups)
-	if err != nil {
-		return err
-	}
-
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["vpn_endpoint_groups"].Metric, prometheus.GaugeValue, float64(len(allEndpointGroups)))
-
 	return nil
 }
 
-// ListIkePolicies : count total number of ipsec ike policies instantiated
-func ListIkePolicies(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	var allIkePolicies []ikepolicies.Policy
-
-	allPagesIkePolicies, err := ikepolicies.List(exporter.ClientV2, ikepolicies.ListOpts{}).AllPages(ctx)
-	if err != nil {
-		return err
-	}
-
-	allIkePolicies, err = ikepolicies.ExtractPolicies(allPagesIkePolicies)
-	if err != nil {
-		return err
-	}
-
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["vpn_ike_policies"].Metric, prometheus.GaugeValue, float64(len(allIkePolicies)))
-
+func (e *NeutronExporter) emitSecGroups(_ context.Context, s *neutronScrape, ch chan<- prometheus.Metric) error {
+	emitGauge(ch, e.descs.SecurityGroups, float64(len(s.securityGroups)))
 	return nil
 }
 
-// ListIpsecPolicies : count total number of ipsec policies instantiated
-func ListIpsecPolicies(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	var allIpsecPolicies []ipsecpolicies.Policy
-
-	allPagesIpsecPolicies, err := ipsecpolicies.List(exporter.ClientV2, ipsecpolicies.ListOpts{}).AllPages(ctx)
-	if err != nil {
-		return err
+func (e *NeutronExporter) emitSubnets(_ context.Context, s *neutronScrape, ch chan<- prometheus.Metric) error {
+	emitGauge(ch, e.descs.Subnets, float64(len(s.subnets)))
+	for i := range s.subnets {
+		subnet := &s.subnets[i]
+		emitGauge(ch, e.descs.Subnet, 1.0, subnet.ID, subnet.TenantID, subnet.Name, subnet.NetworkID, subnet.CIDR,
+			subnet.GatewayIP, strconv.FormatBool(subnet.EnableDHCP), strings.Join(subnet.DNSNameservers, ","), strings.Join(subnet.Tags, ","))
 	}
-
-	allIpsecPolicies, err = ipsecpolicies.ExtractPolicies(allPagesIpsecPolicies)
-	if err != nil {
-		return err
-	}
-
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["vpn_ipsec_policies"].Metric, prometheus.GaugeValue, float64(len(allIpsecPolicies)))
-
 	return nil
 }
 
-// ListVpnServices : count total number of vpn services instantiated and list each VPN Service info
-func ListVpnServices(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	var allVpnServices []services.Service
+func (e *NeutronExporter) emitPorts(_ context.Context, s *neutronScrape, ch chan<- prometheus.Metric) error {
+	portsWithNoIP := float64(0)
+	lbaasPortsInactive := float64(0)
 
-	allPagesVpnServices, err := services.List(exporter.ClientV2, services.ListOpts{}).AllPages(ctx)
-	if err != nil {
-		return err
-	}
+	for i := range s.ports {
+		port := &s.ports[i]
+		if port.Status == "ACTIVE" && len(port.FixedIPs) == 0 {
+			portsWithNoIP++
+		}
 
-	allVpnServices, err = services.ExtractServices(allPagesVpnServices)
-	if err != nil {
-		return err
-	}
+		if port.DeviceOwner == "neutron:LOADBALANCERV2" && port.Status != "ACTIVE" {
+			lbaasPortsInactive++
+		}
 
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["vpn_services"].Metric, prometheus.GaugeValue, float64(len(allVpnServices)))
-	if !exporter.MetricIsDisabled("vpn_service") {
-		for _, service := range allVpnServices {
-			ch <- prometheus.MustNewConstMetric(exporter.Metrics["vpn_service"].Metric,
-				prometheus.GaugeValue, float64(mapVpnServiceStatus(service.Status)), service.ID, service.ProjectID, service.SubnetID, service.RouterID, strconv.FormatBool(service.AdminStateUp), service.Name, service.ExternalV4IP, service.ExternalV6IP, service.FlavorID)
+		if e.descs.Port != nil {
+			// Joining IPs into a string with ',' separator
+			fixedIPs := make([]string, len(port.FixedIPs))
+			for idx, fip := range port.FixedIPs {
+				fixedIPs[idx] = fip.IPAddress
+			}
+
+			emitGauge(ch, e.descs.Port, 1, port.ID, port.NetworkID, port.MACAddress, port.DeviceOwner, port.DeviceID,
+				port.Status, port.VIFType, strconv.FormatBool(port.AdminStateUp), strings.Join(fixedIPs, ","))
 		}
 	}
 
+	// NOTE(mnaser): We should deprecate this and users can replace it by
+	//               count(openstack_neutron_port)
+	emitGauge(ch, e.descs.Ports, float64(len(s.ports)))
+
+	// NOTE(mnaser): We should deprecate this and users can replace it by:
+	//               count(openstack_neutron_port{device_owner="neutron:LOADBALANCERV2",status!="ACTIVE"})
+	emitGauge(ch, e.descs.PortsLBNotActive, lbaasPortsInactive)
+
+	emitGauge(ch, e.descs.PortsNoIPs, portsWithNoIP)
 	return nil
 }
 
-// ListVpnSiteConnections : count total number of vpn ipsec site connections instantiated and list each VPN ipsec site connection info
-func ListVpnSiteConnections(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	var allVpnSiteConnections []siteconnections.Connection
-
-	allPagesVpnSiteConnection, err := siteconnections.List(exporter.ClientV2, siteconnections.ListOpts{}).AllPages(ctx)
-	if err != nil {
-		return err
-	}
-
-	allVpnSiteConnections, err = siteconnections.ExtractConnections(allPagesVpnSiteConnection)
-	if err != nil {
-		return err
-	}
-
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["vpn_siteconnections"].Metric, prometheus.GaugeValue, float64(len(allVpnSiteConnections)))
-	if !exporter.MetricIsDisabled("vpn_siteconnection") {
-		for _, connection := range allVpnSiteConnections {
-			ch <- prometheus.MustNewConstMetric(exporter.Metrics["vpn_siteconnection"].Metric, prometheus.GaugeValue, float64(mapVpnConnectionStatus(connection.Status)), connection.ID, connection.ProjectID, strconv.FormatBool(connection.AdminStateUp), connection.Name, connection.VPNServiceID, connection.IKEPolicyID, connection.IPSecPolicyID, connection.PeerID, connection.PeerEPGroupID, connection.LocalID, connection.LocalEPGroupID)
-		}
-	}
-
-	return nil
-}
-
-// ListRouters : count total number of instantiated Routers and those that are not in ACTIVE state
-func ListRouters(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	var allRouters []routers.Router
-	// We need to know if neutron has ovn backend
-	var ovnBackendEnabled = false
-
-	allPagesRouters, err := routers.List(exporter.ClientV2, routers.ListOpts{}).AllPages(ctx)
-	if err != nil {
-		return err
-	}
-
-	allRouters, err = routers.ExtractRouters(allPagesRouters)
-	if err != nil {
-		return err
-	}
-
-	// Requesting Neutron network-agents with binary='ovn-controller'
-	ovnAgentsPages, err := agents.List(exporter.ClientV2, agents.ListOpts{Binary: "ovn-controller"}).AllPages(ctx)
-	if err != nil {
-		return err
-	}
-
-	ovnAgents, err := agents.ExtractAgents(ovnAgentsPages)
-	if err != nil {
-		return err
-	}
-
-	// If we have received data, then OVN is neutron network backend.
-	if len(ovnAgents) > 0 {
-		ovnBackendEnabled = true
-	}
-
+func (e *NeutronExporter) emitRouters(_ context.Context, s *neutronScrape, ch chan<- prometheus.Metric) error {
 	failedRouters := 0
-	for _, router := range allRouters {
+	for i := range s.routers {
+		router := &s.routers[i]
 		if router.Status != "ACTIVE" {
 			failedRouters++
 		}
 
-		if !exporter.MetricIsDisabled("router") {
-			ch <- prometheus.MustNewConstMetric(exporter.Metrics["router"].Metric,
-				prometheus.GaugeValue, 1, router.ID, router.Name, router.ProjectID,
-				strconv.FormatBool(router.AdminStateUp), router.Status, router.GatewayInfo.NetworkID)
-		}
+		emitGauge(ch, e.descs.Router, 1, router.ID, router.Name, router.ProjectID,
+			strconv.FormatBool(router.AdminStateUp), router.Status, router.GatewayInfo.NetworkID)
+	}
 
-		if ovnBackendEnabled {
-			continue
-			// Because ovn-backend doesn't have router l3-agent entity
-		}
+	emitGauge(ch, e.descs.Routers, float64(len(s.routers)))
+	emitGauge(ch, e.descs.RoutersNotActive, float64(failedRouters))
+	return nil
+}
 
-		if !exporter.MetricIsDisabled("l3_agent_of_router") {
-			allPagesL3Agents, err := routers.ListL3Agents(exporter.ClientV2, router.ID).AllPages(ctx)
-			if err != nil {
-				return err
+func (e *NeutronExporter) emitRouterL3Agents(_ context.Context, s *neutronScrape, ch chan<- prometheus.Metric) error {
+	if s.ovnBackend {
+		// ovn-backend doesn't have router l3-agent entity
+		return nil
+	}
+
+	for i := range s.routers {
+		router := &s.routers[i]
+		for _, agent := range s.routerL3Agents[router.ID] {
+			state := 0
+			if agent.Alive {
+				state = 1
 			}
 
-			l3Agents, err := routers.ExtractL3Agents(allPagesL3Agents)
-			if err != nil {
+			emitGauge(ch, e.descs.L3AgentOfRouter, float64(state), router.ID, agent.ID,
+				agent.HAState, strconv.FormatBool(agent.Alive), strconv.FormatBool(agent.AdminStateUp), agent.Host)
+		}
+	}
+	return nil
+}
+
+func (e *NeutronExporter) emitVpnEndpointGroups(_ context.Context, s *neutronScrape, ch chan<- prometheus.Metric) error {
+	emitGauge(ch, e.descs.VpnEndpointGroups, float64(len(s.vpnEndpointGroups)))
+	return nil
+}
+
+func (e *NeutronExporter) emitVpnIKEPolicies(_ context.Context, s *neutronScrape, ch chan<- prometheus.Metric) error {
+	emitGauge(ch, e.descs.VpnIKEPolicies, float64(len(s.vpnIKEPolicies)))
+	return nil
+}
+
+func (e *NeutronExporter) emitVpnIPsecPolicies(_ context.Context, s *neutronScrape, ch chan<- prometheus.Metric) error {
+	emitGauge(ch, e.descs.VpnIPsecPolicies, float64(len(s.vpnIPsecPolicies)))
+	return nil
+}
+
+func (e *NeutronExporter) emitVpnServices(_ context.Context, s *neutronScrape, ch chan<- prometheus.Metric) error {
+	emitGauge(ch, e.descs.VpnServices, float64(len(s.vpnServices)))
+	for i := range s.vpnServices {
+		service := &s.vpnServices[i]
+		emitGauge(ch, e.descs.VpnService, float64(mapVpnServiceStatus(service.Status)),
+			service.ID, service.ProjectID, service.SubnetID, service.RouterID, strconv.FormatBool(service.AdminStateUp),
+			service.Name, service.ExternalV4IP, service.ExternalV6IP, service.FlavorID)
+	}
+	return nil
+}
+
+func (e *NeutronExporter) emitVpnSiteConnections(_ context.Context, s *neutronScrape, ch chan<- prometheus.Metric) error {
+	emitGauge(ch, e.descs.VpnSiteConnections, float64(len(s.vpnSiteConnections)))
+	for i := range s.vpnSiteConnections {
+		connection := &s.vpnSiteConnections[i]
+		emitGauge(ch, e.descs.VpnSiteConnection, float64(mapVpnConnectionStatus(connection.Status)),
+			connection.ID, connection.ProjectID, strconv.FormatBool(connection.AdminStateUp), connection.Name,
+			connection.VPNServiceID, connection.IKEPolicyID, connection.IPSecPolicyID, connection.PeerID,
+			connection.PeerEPGroupID, connection.LocalID, connection.LocalEPGroupID)
+	}
+	return nil
+}
+
+func (e *NeutronExporter) emitAgents(_ context.Context, s *neutronScrape, ch chan<- prometheus.Metric) error {
+	for i := range s.agents {
+		agent := &s.agents[i]
+		state := 0
+		if agent.Alive {
+			state = 1
+		}
+
+		adminState := "down"
+		if agent.AdminStateUp {
+			adminState = "up"
+		}
+
+		id := agent.ID
+		if id == "" {
+			var err error
+			if id, err = e.UUIDGenFunc(); err != nil {
 				return err
 			}
+		}
 
-			for _, agent := range l3Agents {
-				state := 0
-				if agent.Alive {
-					state = 1
+		emitGauge(ch, e.descs.AgentState, float64(state), id, agent.Host, agent.Binary, adminState, agent.AvailabilityZone)
+	}
+	return nil
+}
+
+func (e *NeutronExporter) emitNetIPAvail(_ context.Context, s *neutronScrape, ch chan<- prometheus.Metric) error {
+	for i := range s.netIPAvailabilities {
+		network := &s.netIPAvailabilities[i]
+		for j := range network.Subnets {
+			subnet := &network.Subnets[j]
+			emitGauge(ch, e.descs.NetworkIPAvailabilitiesTotal, subnet.TotalIPs, network.NetworkID,
+				network.NetworkName, strconv.Itoa(subnet.IPVersion), subnet.CIDR, subnet.SubnetName, network.ProjectID)
+			emitGauge(ch, e.descs.NetworkIPAvailabilitiesUsed, subnet.UsedIPs, network.NetworkID,
+				network.NetworkName, strconv.Itoa(subnet.IPVersion), subnet.CIDR, subnet.SubnetName, network.ProjectID)
+		}
+	}
+	return nil
+}
+
+// emitSubnetPools : count used/free/total number of subnets per subnet pool
+func (e *NeutronExporter) emitSubnetPools(_ context.Context, s *neutronScrape, ch chan<- prometheus.Metric) error {
+	subnetPools, err := subnetpoolsWithSubnets(s.subnetPools, s.subnets)
+	if err != nil {
+		return err
+	}
+
+	for i := range subnetPools {
+		subnetPool := &subnetPools[i]
+		ipPrefixes, err := subnetPool.IPPrefixes()
+		if err != nil {
+			return err
+		}
+
+		for _, ipPrefix := range ipPrefixes {
+			for prefixLength := subnetPool.MinPrefixLen; prefixLength <= subnetPool.MaxPrefixLen; prefixLength++ {
+				if prefixLength < int(ipPrefix.Bits()) {
+					continue
 				}
 
-				ch <- prometheus.MustNewConstMetric(exporter.Metrics["l3_agent_of_router"].Metric,
-					prometheus.GaugeValue, float64(state), router.ID, agent.ID,
-					agent.HAState, strconv.FormatBool(agent.Alive), strconv.FormatBool(agent.AdminStateUp), agent.Host)
+				totalSubnets := math.Pow(2, float64(prefixLength-int(ipPrefix.Bits())))
+				emitGauge(ch, e.descs.SubnetsTotal, totalSubnets, strconv.Itoa(subnetPool.IPversion), ipPrefix.String(), strconv.Itoa(prefixLength),
+					subnetPool.ProjectID, subnetPool.ID, subnetPool.Name)
+
+				usedSubnets := calculateUsedSubnets(subnetPool.subnets, ipPrefix, prefixLength)
+				emitGauge(ch, e.descs.SubnetsUsed, usedSubnets, strconv.Itoa(subnetPool.IPversion), ipPrefix.String(), strconv.Itoa(prefixLength),
+					subnetPool.ProjectID, subnetPool.ID, subnetPool.Name)
+
+				freeSubnets, err := calculateFreeSubnets(&ipPrefix, subnetPool.subnets, prefixLength)
+				if err != nil {
+					return err
+				}
+				emitGauge(ch, e.descs.SubnetsFree, freeSubnets, strconv.Itoa(subnetPool.IPversion), ipPrefix.String(), strconv.Itoa(prefixLength),
+					subnetPool.ProjectID, subnetPool.ID, subnetPool.Name)
 			}
 		}
 	}
-
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["routers"].Metric,
-		prometheus.GaugeValue, float64(len(allRouters)))
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["routers_not_active"].Metric,
-		prometheus.GaugeValue, float64(failedRouters))
-
 	return nil
 }
+
+func (e *NeutronExporter) emitQuotas(_ context.Context, s *neutronScrape, ch chan<- prometheus.Metric) error {
+	for i := range s.quotas {
+		entry := &s.quotas[i]
+		emitNeutronQuotaDetail(ch, e.descs.QuotaNetwork, entry.quota.Network, entry.projectName, entry.projectID)
+		emitNeutronQuotaDetail(ch, e.descs.QuotaSubnet, entry.quota.Subnet, entry.projectName, entry.projectID)
+		emitNeutronQuotaDetail(ch, e.descs.QuotaSubnetPool, entry.quota.SubnetPool, entry.projectName, entry.projectID)
+		emitNeutronQuotaDetail(ch, e.descs.QuotaPort, entry.quota.Port, entry.projectName, entry.projectID)
+		emitNeutronQuotaDetail(ch, e.descs.QuotaRouter, entry.quota.Router, entry.projectName, entry.projectID)
+		emitNeutronQuotaDetail(ch, e.descs.QuotaFloatingIP, entry.quota.FloatingIP, entry.projectName, entry.projectID)
+		emitNeutronQuotaDetail(ch, e.descs.QuotaSecurityGroup, entry.quota.SecurityGroup, entry.projectName, entry.projectID)
+		emitNeutronQuotaDetail(ch, e.descs.QuotaSecurityGroupRule, entry.quota.SecurityGroupRule, entry.projectName, entry.projectID)
+		emitNeutronQuotaDetail(ch, e.descs.QuotaRBACPolicy, entry.quota.RBACPolicy, entry.projectName, entry.projectID)
+	}
+	return nil
+}
+
+func emitNeutronQuotaDetail(ch chan<- prometheus.Metric, desc *prometheus.Desc, q quotas.QuotaDetail, projectName, projectID string) {
+	emitGauge(ch, desc, float64(q.Used), "used", projectName, projectID)
+	emitGauge(ch, desc, float64(q.Reserved), "reserved", projectName, projectID)
+	emitGauge(ch, desc, float64(q.Limit), "limit", projectName, projectID)
+}
+
+// --- Subnet pool helpers ---
 
 // subnetpoolWithSubnets : subnetpools.SubnetPool augmented with its subnets
 type subnetpoolWithSubnets struct {
@@ -741,102 +830,4 @@ func calculateUsedSubnets(subnets []netip.Prefix, ipPrefix netip.Prefix, prefixL
 	}
 
 	return float64(result[prefixLength])
-}
-
-// ListSubnetsPerPool : Count used/free/total number of subnets per subnet pool
-func ListSubnetsPerPool(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	allPagesSubnets, err := subnets.List(exporter.ClientV2, subnets.ListOpts{}).AllPages(ctx)
-	if err != nil {
-		return err
-	}
-
-	allSubnets, err := subnets.ExtractSubnets(allPagesSubnets)
-	if err != nil {
-		return err
-	}
-
-	allPagesSubnetPools, err := subnetpools.List(exporter.ClientV2, subnetpools.ListOpts{}).AllPages(ctx)
-	if err != nil {
-		return err
-	}
-
-	allSubnetPools, err := subnetpools.ExtractSubnetPools(allPagesSubnetPools)
-	if err != nil {
-		return err
-	}
-
-	subnetPools, err := subnetpoolsWithSubnets(allSubnetPools, allSubnets)
-	if err != nil {
-		return err
-	}
-
-	for _, subnetPool := range subnetPools {
-		ipPrefixes, err := subnetPool.IPPrefixes()
-		if err != nil {
-			return err
-		}
-
-		for _, ipPrefix := range ipPrefixes {
-			for prefixLength := subnetPool.MinPrefixLen; prefixLength <= subnetPool.MaxPrefixLen; prefixLength++ {
-				if prefixLength < int(ipPrefix.Bits()) {
-					continue
-				}
-
-				totalSubnets := math.Pow(2, float64(prefixLength-int(ipPrefix.Bits())))
-				ch <- prometheus.MustNewConstMetric(exporter.Metrics["subnets_total"].Metric,
-					prometheus.GaugeValue, totalSubnets, strconv.Itoa(subnetPool.IPversion), ipPrefix.String(), strconv.Itoa(prefixLength),
-					subnetPool.ProjectID, subnetPool.ID, subnetPool.Name)
-
-				usedSubnets := calculateUsedSubnets(subnetPool.subnets, ipPrefix, prefixLength)
-				ch <- prometheus.MustNewConstMetric(exporter.Metrics["subnets_used"].Metric,
-					prometheus.GaugeValue, usedSubnets, strconv.Itoa(subnetPool.IPversion), ipPrefix.String(), strconv.Itoa(prefixLength),
-					subnetPool.ProjectID, subnetPool.ID, subnetPool.Name)
-
-				freeSubnets, err := calculateFreeSubnets(&ipPrefix, subnetPool.subnets, prefixLength)
-				if err != nil {
-					return err
-				}
-
-				ch <- prometheus.MustNewConstMetric(exporter.Metrics["subnets_free"].Metric,
-					prometheus.GaugeValue, freeSubnets, strconv.Itoa(subnetPool.IPversion), ipPrefix.String(), strconv.Itoa(prefixLength),
-					subnetPool.ProjectID, subnetPool.ID, subnetPool.Name)
-			}
-		}
-	}
-
-	return nil
-}
-
-func collectNeutronQuotaDetail(ch chan<- prometheus.Metric, metric *prometheus.Desc, q quotas.QuotaDetail, projectName, projectID string) {
-	ch <- prometheus.MustNewConstMetric(metric, prometheus.GaugeValue, float64(q.Used), "used", projectName, projectID)
-	ch <- prometheus.MustNewConstMetric(metric, prometheus.GaugeValue, float64(q.Reserved), "reserved", projectName, projectID)
-	ch <- prometheus.MustNewConstMetric(metric, prometheus.GaugeValue, float64(q.Limit), "limit", projectName, projectID)
-}
-
-func ListNetworkQuotas(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	allProjects, err := GetProjects(ctx, exporter)
-	if err != nil {
-		return err
-	}
-
-	for _, p := range allProjects {
-		// quota are obtained from the neutron API, so now we can just use this exporter's client
-		quota, err := quotas.GetDetail(ctx, exporter.ClientV2, p.ID).Extract()
-		if err != nil {
-			return err
-		}
-
-		collectNeutronQuotaDetail(ch, exporter.Metrics["quota_network"].Metric, quota.Network, p.Name, p.ID)
-		collectNeutronQuotaDetail(ch, exporter.Metrics["quota_subnet"].Metric, quota.Subnet, p.Name, p.ID)
-		collectNeutronQuotaDetail(ch, exporter.Metrics["quota_subnetpool"].Metric, quota.SubnetPool, p.Name, p.ID)
-		collectNeutronQuotaDetail(ch, exporter.Metrics["quota_port"].Metric, quota.Port, p.Name, p.ID)
-		collectNeutronQuotaDetail(ch, exporter.Metrics["quota_router"].Metric, quota.Router, p.Name, p.ID)
-		collectNeutronQuotaDetail(ch, exporter.Metrics["quota_floatingip"].Metric, quota.FloatingIP, p.Name, p.ID)
-		collectNeutronQuotaDetail(ch, exporter.Metrics["quota_security_group"].Metric, quota.SecurityGroup, p.Name, p.ID)
-		collectNeutronQuotaDetail(ch, exporter.Metrics["quota_security_group_rule"].Metric, quota.SecurityGroupRule, p.Name, p.ID)
-		collectNeutronQuotaDetail(ch, exporter.Metrics["quota_rbac_policy"].Metric, quota.RBACPolicy, p.Name, p.ID)
-
-	}
-
-	return nil
 }
