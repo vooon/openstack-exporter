@@ -24,9 +24,7 @@ type poolExporter struct {
 func (f *poolExporter) Describe(chan<- *prometheus.Desc) {}
 func (f *poolExporter) Collect(chan<- prometheus.Metric) {}
 func (f *poolExporter) GetName() string                  { return f.service }
-func (f *poolExporter) AddMetric(string, ListFunc, []string, string, prometheus.Labels) {
-}
-func (f *poolExporter) MetricIsDisabled(string) bool { return false }
+func (f *poolExporter) IsMetricEnabled(...string) bool   { return true }
 
 // fakeFactory stands in for NewExporter: it fails the services listed in
 // failing and counts every call.

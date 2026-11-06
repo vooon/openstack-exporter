@@ -114,9 +114,7 @@ type stubExporter struct{ name string }
 func (s *stubExporter) Describe(chan<- *prometheus.Desc) {}
 func (s *stubExporter) Collect(chan<- prometheus.Metric) {}
 func (s *stubExporter) GetName() string                  { return s.name }
-func (s *stubExporter) AddMetric(string, exporters.ListFunc, []string, string, prometheus.Labels) {
-}
-func (s *stubExporter) MetricIsDisabled(string) bool { return false }
+func (s *stubExporter) IsMetricEnabled(...string) bool   { return true }
 
 func stubFactory(failing ...string) func(string, exporters.ExporterOptions, *slog.Logger) (exporters.OpenStackExporter, error) {
 	return func(service string, _ exporters.ExporterOptions, _ *slog.Logger) (exporters.OpenStackExporter, error) {
