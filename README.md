@@ -108,6 +108,7 @@ Flags:
       --[no-]collect-metric-time
                                  time spent collecting each metric
   -d, --disable-metric= ...      multiple --disable-metric can be specified in the format: service-metric (i.e: cinder-snapshots)
+  -e, --enable-metric= ...       keep a slow or deprecated metric enabled despite --disable-slow-metrics / --disable-deprecated-metrics; format: service-metric (i.e: nova-limits_vcpus_max)
       --[no-]disable-slow-metrics
                                  Disable slow metrics for performance reasons
       --[no-]disable-deprecated-metrics
@@ -126,6 +127,9 @@ Flags:
       --nova.metadata-extra-labels=LABEL=KEY,KEY ...
                                  Map provided server metadata keys to labels in
                                  openstack_nova_server_status metric
+      --reload-interval=1h       How often services are re-detected and every
+                                 collector is re-bound; SIGHUP reloads at any
+                                 time; 0 disables the timer
       --[no-]disable-service.network
                                  Disable the network service exporter in strict mode
       --[no-]disable-service.compute
@@ -184,6 +188,38 @@ Single-cloud service selection behavior:
 * `--no-disable-service.<service>` explicitly enables that exporter.
 * `--disable-service-autodetect` disables autodetection and treats remaining `AUTO` services as enabled (strict list mode from flags only).
 * In `--multi-cloud` mode, autodetection is not used; service flags define the configured set used by `/probe`.
+
+### Collector lifecycle
+
+Every service collector is *bound* before it serves metrics: the exporter
+authenticates to Keystone, looks the service up in the catalog and runs the
+service's own probes (API microversion, extensions). Binding happens in the
+background, so the HTTP endpoint is up before the first bind finishes, and it
+is repeated:
+
+* every `--reload-interval` (default one hour, `0` disables the timer) and on
+  `SIGHUP`, when the service list is re-detected and every collector is bound
+  again with a fresh token. A bind that fails keeps the previous collector;
+* on every scrape for a service that is not bound yet, with exponential
+  backoff between attempts (5 s to 5 min).
+
+A service that is unreachable when the exporter starts therefore shows up as
+soon as it comes back, instead of staying missing until a restart. When the
+catalog lookup fails, the previous service list is kept, or just the
+explicitly enabled services on the first attempt, and the lookup is retried
+with backoff.
+
+The state is exposed next to the service metrics, so alerts do not need to
+know which services a cloud has:
+
+Metric | Labels | Meaning
+--- | --- | ---
+`openstack_exporter_collector_ready` | `cloud`, `service` | `1` while the collector is bound, `0` while it waits for a successful bind. Only tracked services appear.
+`openstack_exporter_collector_bound_timestamp_seconds` | `cloud`, `service` | Unix time of the last successful bind.
+`openstack_exporter_service_autodetect_success` | `cloud` | Single-cloud mode: `1` when the last catalog lookup succeeded, `0` when the exporter runs on the previous or the explicitly enabled service set.
+
+`openstack_<service>_up` keeps its meaning: whether the bound collector could
+collect from the service on this scrape.
 
 Query Parameter | Description
 --- | ---
@@ -334,7 +370,9 @@ This fallback mechanism ensures that OpenStack-Exporter works correctly even whe
 
 There are some metrics that, depending on the cloud deployment size, can be slow to be
 collected because iteration over different projects is required. Those metrics are marked as `slow` and can be disabled with the command
-line parameter `--disable-slow-metrics`.
+line parameter `--disable-slow-metrics`. Individual slow or deprecated metrics can be kept with
+`--enable-metric <exporter>-<metric>` (for example `--enable-metric nova-limits_vcpus_max`);
+`--disable-metric` always wins over `--enable-metric`.
 
 Currently flagged as slow metrics are:
 
