@@ -12,11 +12,18 @@ import (
 	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/services"
 	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/snapshots"
 	"github.com/gophercloud/gophercloud/v2/openstack/blockstorage/v3/volumes"
+	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/projects"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+func init() {
+	RegisterTypedExporter("volume", NewCinderExporter)
+}
+
 type CinderExporter struct {
 	BaseOpenStackExporter
+	descs cinderDescs
+	sched Schedule[cinderScrape]
 }
 
 // Microversion required for the os-backup-project-attr:project_id attribute
@@ -50,299 +57,285 @@ func mapVolumeStatus(volStatus string) int {
 	return mapStatus(knownVolumeStatuses, volStatus)
 }
 
-var defaultCinderMetrics = []Metric{
-	{Name: "volumes", Fn: ListVolumes},
-	{Name: "snapshots", Fn: ListSnapshots},
-	{Name: "snapshot_gb", Labels: []string{"id", "name", "status", "tenant_id", "volume_id"}, Fn: nil},
-	{Name: "backups", Fn: ListBackups},
-	{Name: "backup_gb", Labels: []string{"id", "name", "status", "tenant_id", "volume_id",
-		"snapshot_id", "incremental"}, Fn: nil},
-	{Name: "agent_state", Labels: []string{"uuid", "hostname", "service", "adminState", "zone", "disabledReason"}, Fn: ListCinderAgentState},
-	{Name: "volume_gb", Labels: []string{"id", "name", "status", "availability_zone", "bootable", "tenant_id", "user_id", "volume_type", "server_id"}, Fn: nil},
-	{Name: "volume_status", Labels: []string{"id", "name", "status", "bootable", "tenant_id", "size", "volume_type", "server_id"}, Fn: ListVolumesStatus, Slow: false, DeprecatedVersion: "1.4"},
-	{Name: "volume_status_counter", Labels: []string{"status"}, Fn: nil},
-	{Name: "pool_capacity_free_gb", Labels: []string{"name", "volume_backend_name", "vendor_name"}, Fn: ListCinderPoolCapacityFree},
-	{Name: "pool_capacity_total_gb", Labels: []string{"name", "volume_backend_name", "vendor_name"}, Fn: nil},
-	{Name: "limits_volume_max_gb", Labels: []string{"tenant", "tenant_id"}, Fn: ListVolumeLimits, Slow: true},
-	{Name: "limits_volume_used_gb", Labels: []string{"tenant", "tenant_id"}, Fn: nil, Slow: true},
-	{Name: "limits_backup_max_gb", Labels: []string{"tenant", "tenant_id"}, Fn: nil, Slow: true},
-	{Name: "limits_backup_used_gb", Labels: []string{"tenant", "tenant_id"}, Fn: nil, Slow: true},
-	{Name: "volume_type_quota_gigabytes", Labels: []string{"tenant", "tenant_id", "volume_type"}, Fn: nil, Slow: true},
+type cinderDescs struct {
+	Volumes             *prometheus.Desc `metric:"volumes"`
+	Snapshots           *prometheus.Desc `metric:"snapshots"`
+	SnapshotGB          *prometheus.Desc `metric:"snapshot_gb"                 labels:"id,name,status,tenant_id,volume_id"`
+	Backups             *prometheus.Desc `metric:"backups"`
+	BackupGB            *prometheus.Desc `metric:"backup_gb"                   labels:"id,name,status,tenant_id,volume_id,snapshot_id,incremental"`
+	AgentState          *prometheus.Desc `metric:"agent_state"                 labels:"uuid,hostname,service,adminState,zone,disabledReason"`
+	VolumeGB            *prometheus.Desc `metric:"volume_gb"                   labels:"id,name,status,availability_zone,bootable,tenant_id,user_id,volume_type,server_id"`
+	VolumeStatus        *prometheus.Desc `metric:"volume_status"               labels:"id,name,status,bootable,tenant_id,size,volume_type,server_id"                   deprecated:"1.4"`
+	VolumeStatusCounter *prometheus.Desc `metric:"volume_status_counter"       labels:"status"`
+	PoolCapacityFreeGB  *prometheus.Desc `metric:"pool_capacity_free_gb"       labels:"name,volume_backend_name,vendor_name"`
+	PoolCapacityTotalGB *prometheus.Desc `metric:"pool_capacity_total_gb"      labels:"name,volume_backend_name,vendor_name"`
+	LimitsVolumeMaxGB   *prometheus.Desc `metric:"limits_volume_max_gb"        labels:"tenant,tenant_id"             slow:"true"`
+	LimitsVolumeUsedGB  *prometheus.Desc `metric:"limits_volume_used_gb"       labels:"tenant,tenant_id"             slow:"true"`
+	LimitsBackupMaxGB   *prometheus.Desc `metric:"limits_backup_max_gb"        labels:"tenant,tenant_id"             slow:"true"`
+	LimitsBackupUsedGB  *prometheus.Desc `metric:"limits_backup_used_gb"       labels:"tenant,tenant_id"             slow:"true"`
+	VolumeTypeQuota     *prometheus.Desc `metric:"volume_type_quota_gigabytes" labels:"tenant,tenant_id,volume_type" slow:"true"`
+}
+
+type cinderScrape struct {
+	volumes   []volumes.Volume
+	snapshots []snapshots.Snapshot
+	backups   []backups.Backup
+	agents    []services.Service
+	pools     []schedulerstats.StoragePool
+	projects  []projects.Project
+	limits    []cinderProjectLimits
+}
+
+// cinderProjectLimits bundles the quota usage and quota set of one project.
+type cinderProjectLimits struct {
+	projectName string
+	projectID   string
+	usage       quotasets.QuotaUsageSet
+	quotas      quotasets.QuotaSet
 }
 
 func NewCinderExporter(config *ExporterConfig, logger *slog.Logger) (*CinderExporter, error) {
-	exporter := CinderExporter{
-		BaseOpenStackExporter{
+	e := &CinderExporter{
+		BaseOpenStackExporter: BaseOpenStackExporter{
 			Name:           "cinder",
 			ExporterConfig: *config,
 			logger:         logger,
 		},
 	}
-
-	for _, metric := range defaultCinderMetrics {
-		if exporter.isDeprecatedMetric(&metric) {
-			continue
-		}
-		if !exporter.isSlowMetric(&metric) {
-			exporter.AddMetric(metric.Name, metric.Fn, metric.Labels, metric.DeprecatedVersion, nil)
-		}
+	graph := Graph[cinderScrape]{
+		Sources: []Source[cinderScrape]{
+			{Name: "volumes", Fetch: e.fetchVolumes},
+			{Name: "snapshots", Fetch: e.fetchSnapshots},
+			{Name: "backups", Fetch: e.fetchBackups},
+			{Name: "agents", Fetch: e.fetchAgents},
+			{Name: "pools", Fetch: e.fetchPools},
+			{Name: "projects", Fetch: e.fetchProjects},
+			{Name: "limits", DependsOn: []string{"projects"}, Fetch: e.fetchLimits},
+		},
+		Emitters: []Emitter[cinderScrape]{
+			{Name: "volumes", Metrics: []string{"volumes", "volume_gb", "volume_status_counter"}, Sources: []string{"volumes"}, Emit: e.emitVolumes},
+			{Name: "volume_status", Metrics: []string{"volume_status"}, Sources: []string{"volumes"}, Emit: e.emitVolumeStatus},
+			{Name: "snapshots", Metrics: []string{"snapshots", "snapshot_gb"}, Sources: []string{"snapshots"}, Emit: e.emitSnapshots},
+			{Name: "backups", Metrics: []string{"backups", "backup_gb"}, Sources: []string{"backups"}, Emit: e.emitBackups},
+			{Name: "agents", Metrics: []string{"agent_state"}, Sources: []string{"agents"}, Emit: e.emitAgents},
+			{Name: "pools", Metrics: []string{"pool_capacity_free_gb", "pool_capacity_total_gb"}, Sources: []string{"pools"}, Emit: e.emitPools},
+			{Name: "limits", Metrics: []string{"limits_volume_max_gb", "limits_volume_used_gb", "limits_backup_max_gb", "limits_backup_used_gb", "volume_type_quota_gigabytes"}, Sources: []string{"limits"}, Emit: e.emitLimits},
+		},
 	}
-
-	return &exporter, nil
+	sched, err := SetupExporter(&e.BaseOpenStackExporter, &e.descs, &graph)
+	if err != nil {
+		return nil, err
+	}
+	e.sched = sched
+	return e, nil
 }
 
-func ListVolumesStatus(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	type VolumeWithExt = volumes.Volume
-
-	var allVolumes []VolumeWithExt
-	volumeListOption := getVolumeListOptions(exporter.TenantID)
-
-	allPagesVolumes, err := volumes.List(exporter.ClientV2, volumeListOption).AllPages(ctx)
-	if err != nil {
-		return err
-	}
-
-	err = volumes.ExtractVolumesInto(allPagesVolumes, &allVolumes)
-	if err != nil {
-		return err
-	}
-
-	// Volume status metrics
-	for _, volume := range allVolumes {
-		serverID := ""
-		if len(volume.Attachments) > 0 {
-			serverID = volume.Attachments[0].ServerID
-		}
-
-		ch <- prometheus.MustNewConstMetric(exporter.Metrics["volume_status"].Metric,
-			prometheus.GaugeValue, float64(mapVolumeStatus(volume.Status)), volume.ID, volume.Name,
-			volume.Status, volume.Bootable, volume.TenantID, strconv.Itoa(volume.Size), volume.VolumeType, serverID)
-	}
-
-	return nil
+func (e *CinderExporter) Collect(ch chan<- prometheus.Metric) {
+	CollectSchedule(&e.BaseOpenStackExporter, &e.sched, new(cinderScrape), ch)
 }
 
-func ListVolumes(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	type VolumeWithExt = volumes.Volume
-
-	var allVolumes []VolumeWithExt
-	volumeListOption := getVolumeListOptions(exporter.TenantID)
-
-	allPagesVolumes, err := volumes.List(exporter.ClientV2, volumeListOption).AllPages(ctx)
+func (e *CinderExporter) fetchVolumes(ctx context.Context, s *cinderScrape) error {
+	allPages, err := volumes.List(e.ClientV2, getVolumeListOptions(e.TenantID)).AllPages(ctx)
 	if err != nil {
 		return err
 	}
-
-	err = volumes.ExtractVolumesInto(allPagesVolumes, &allVolumes)
-	if err != nil {
-		return err
-	}
-
-	volume_status_counter := make(map[string]int, len(knownVolumeStatuses))
-	for k := range knownVolumeStatuses {
-		volume_status_counter[k] = 0
-	}
-
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["volumes"].Metric,
-		prometheus.GaugeValue, float64(len(allVolumes)))
-
-	for _, volume := range allVolumes {
-		serverID := ""
-		if len(volume.Attachments) > 0 {
-			serverID = volume.Attachments[0].ServerID
-		}
-
-		// Volume_gb metrics
-		ch <- prometheus.MustNewConstMetric(exporter.Metrics["volume_gb"].Metric,
-			prometheus.GaugeValue, float64(volume.Size), volume.ID, volume.Name,
-			volume.Status, volume.AvailabilityZone, volume.Bootable, volume.TenantID, volume.UserID, volume.VolumeType, serverID)
-
-		// collect statuses
-		volume_status_counter[volume.Status]++
-	}
-
-	// Volume status counter metrics
-	for status, count := range volume_status_counter {
-		ch <- prometheus.MustNewConstMetric(
-			exporter.Metrics["volume_status_counter"].Metric,
-			prometheus.GaugeValue,
-			float64(count),
-			status)
-	}
-
-	return nil
+	return volumes.ExtractVolumesInto(allPages, &s.volumes)
 }
 
-func ListSnapshots(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	var allSnapshots []snapshots.Snapshot
-	snapshotListOption := getSnapshotListOptions(exporter.TenantID)
-
+func (e *CinderExporter) fetchSnapshots(ctx context.Context, s *cinderScrape) error {
 	// The detail listing is required to get the snapshot project ID.
-	allPagesSnapshot, err := snapshots.ListDetail(exporter.ClientV2, snapshotListOption).AllPages(ctx)
+	allPages, err := snapshots.ListDetail(e.ClientV2, getSnapshotListOptions(e.TenantID)).AllPages(ctx)
 	if err != nil {
 		return err
 	}
-
-	allSnapshots, err = snapshots.ExtractSnapshots(allPagesSnapshot)
-	if err != nil {
-		return err
-	}
-
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["snapshots"].Metric,
-		prometheus.GaugeValue, float64(len(allSnapshots)))
-
-	for _, snapshot := range allSnapshots {
-		ch <- prometheus.MustNewConstMetric(exporter.Metrics["snapshot_gb"].Metric,
-			prometheus.GaugeValue, float64(snapshot.Size), snapshot.ID, snapshot.Name,
-			snapshot.Status, snapshot.ProjectID, snapshot.VolumeID)
-	}
-
-	return nil
+	s.snapshots, err = snapshots.ExtractSnapshots(allPages)
+	return err
 }
 
-func ListBackups(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	var allBackups []backups.Backup
-
+func (e *CinderExporter) fetchBackups(ctx context.Context, s *cinderScrape) error {
 	// The detail listing is required to get size, status and project ID of
 	// each backup. ListDetailOpts cannot filter on a project, so when the
 	// exporter is scoped to a single tenant the result is filtered below.
-	listOpts := backups.ListDetailOpts{AllTenants: exporter.TenantID == ""}
+	listOpts := backups.ListDetailOpts{AllTenants: e.TenantID == ""}
 
 	// The project ID attribute is only returned with microversion 3.18 or
 	// later; a copy of the client is used to not affect other metrics.
-	client := *exporter.ClientV2
+	client := *e.ClientV2
 	client.Microversion = backupProjectIDMicroversion
 
-	allPagesBackup, err := backups.ListDetail(&client, listOpts).AllPages(ctx)
+	allPages, err := backups.ListDetail(&client, listOpts).AllPages(ctx)
+	if err != nil {
+		return err
+	}
+	allBackups, err := backups.ExtractBackups(allPages)
 	if err != nil {
 		return err
 	}
 
-	allBackups, err = backups.ExtractBackups(allPagesBackup)
-	if err != nil {
-		return err
-	}
-
-	count := 0
+	s.backups = make([]backups.Backup, 0, len(allBackups))
 	for _, backup := range allBackups {
-		if exporter.TenantID != "" && backup.ProjectID != exporter.TenantID {
+		if e.TenantID != "" && backup.ProjectID != e.TenantID {
 			continue
 		}
-		count++
+		s.backups = append(s.backups, backup)
+	}
+	return nil
+}
 
-		ch <- prometheus.MustNewConstMetric(exporter.Metrics["backup_gb"].Metric,
-			prometheus.GaugeValue, float64(backup.Size), backup.ID, backup.Name,
+func (e *CinderExporter) fetchAgents(ctx context.Context, s *cinderScrape) error {
+	allPages, err := services.List(e.ClientV2, services.ListOpts{}).AllPages(ctx)
+	if err != nil {
+		return err
+	}
+	s.agents, err = services.ExtractServices(allPages)
+	return err
+}
+
+func (e *CinderExporter) fetchPools(ctx context.Context, s *cinderScrape) error {
+	allPages, err := schedulerstats.List(e.ClientV2, schedulerstats.ListOpts{Detail: true}).AllPages(ctx)
+	if err != nil {
+		return err
+	}
+	s.pools, err = schedulerstats.ExtractStoragePools(allPages)
+	return err
+}
+
+func (e *CinderExporter) fetchProjects(ctx context.Context, s *cinderScrape) error {
+	var err error
+	s.projects, err = GetProjects(ctx, &e.BaseOpenStackExporter)
+	return err
+}
+
+func (e *CinderExporter) fetchLimits(ctx context.Context, s *cinderScrape) error {
+	s.limits = make([]cinderProjectLimits, 0, len(s.projects))
+	for _, p := range s.projects {
+		// Limits and quotas are obtained from the cinder API, so this
+		// exporter's client is used.
+		usage, err := quotasets.GetUsage(ctx, e.ClientV2, p.ID).Extract()
+		if err != nil {
+			return err
+		}
+		quotas, err := quotasets.Get(ctx, e.ClientV2, p.ID).Extract()
+		if err != nil {
+			return err
+		}
+		s.limits = append(s.limits, cinderProjectLimits{
+			projectName: p.Name,
+			projectID:   p.ID,
+			usage:       usage,
+			quotas:      *quotas,
+		})
+	}
+	return nil
+}
+
+func volumeServerID(volume *volumes.Volume) string {
+	if len(volume.Attachments) > 0 {
+		return volume.Attachments[0].ServerID
+	}
+	return ""
+}
+
+func (e *CinderExporter) emitVolumes(_ context.Context, s *cinderScrape, ch chan<- prometheus.Metric) error {
+	emitGauge(ch, e.descs.Volumes, float64(len(s.volumes)))
+
+	statusCounter := make(map[string]int, len(knownVolumeStatuses))
+	for k := range knownVolumeStatuses {
+		statusCounter[k] = 0
+	}
+
+	for i := range s.volumes {
+		volume := &s.volumes[i]
+		emitGauge(ch, e.descs.VolumeGB, float64(volume.Size), volume.ID, volume.Name,
+			volume.Status, volume.AvailabilityZone, volume.Bootable, volume.TenantID, volume.UserID, volume.VolumeType, volumeServerID(volume))
+		statusCounter[volume.Status]++
+	}
+
+	for status, count := range statusCounter {
+		emitGauge(ch, e.descs.VolumeStatusCounter, float64(count), status)
+	}
+	return nil
+}
+
+func (e *CinderExporter) emitVolumeStatus(_ context.Context, s *cinderScrape, ch chan<- prometheus.Metric) error {
+	for i := range s.volumes {
+		volume := &s.volumes[i]
+		emitGauge(ch, e.descs.VolumeStatus, float64(mapVolumeStatus(volume.Status)), volume.ID, volume.Name,
+			volume.Status, volume.Bootable, volume.TenantID, strconv.Itoa(volume.Size), volume.VolumeType, volumeServerID(volume))
+	}
+	return nil
+}
+
+func (e *CinderExporter) emitSnapshots(_ context.Context, s *cinderScrape, ch chan<- prometheus.Metric) error {
+	emitGauge(ch, e.descs.Snapshots, float64(len(s.snapshots)))
+	for i := range s.snapshots {
+		snapshot := &s.snapshots[i]
+		emitGauge(ch, e.descs.SnapshotGB, float64(snapshot.Size), snapshot.ID, snapshot.Name,
+			snapshot.Status, snapshot.ProjectID, snapshot.VolumeID)
+	}
+	return nil
+}
+
+func (e *CinderExporter) emitBackups(_ context.Context, s *cinderScrape, ch chan<- prometheus.Metric) error {
+	for i := range s.backups {
+		backup := &s.backups[i]
+		emitGauge(ch, e.descs.BackupGB, float64(backup.Size), backup.ID, backup.Name,
 			backup.Status, backup.ProjectID, backup.VolumeID, backup.SnapshotID,
 			strconv.FormatBool(backup.IsIncremental))
 	}
-
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["backups"].Metric,
-		prometheus.GaugeValue, float64(count))
-
+	emitGauge(ch, e.descs.Backups, float64(len(s.backups)))
 	return nil
 }
 
-func ListCinderAgentState(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	var allServices []services.Service
-
-	allPagesService, err := services.List(exporter.ClientV2, services.ListOpts{}).AllPages(ctx)
-	if err != nil {
-		return err
-	}
-	allServices, err = services.ExtractServices(allPagesService)
-	if err != nil {
-		return err
-	}
-
-	for _, service := range allServices {
-		var state = 0
-		var id string
-
-		if service.State == "up" {
+func (e *CinderExporter) emitAgents(_ context.Context, s *cinderScrape, ch chan<- prometheus.Metric) error {
+	for i := range s.agents {
+		agent := &s.agents[i]
+		state := 0.0
+		if agent.State == "up" {
 			state = 1
 		}
-		if !exporter.DisableCinderAgentUUID {
-			if id, err = exporter.UUIDGenFunc(); err != nil {
+		var id string
+		if !e.DisableCinderAgentUUID {
+			var err error
+			if id, err = e.UUIDGenFunc(); err != nil {
 				return err
 			}
 		}
-
-		ch <- prometheus.MustNewConstMetric(exporter.Metrics["agent_state"].Metric,
-			prometheus.GaugeValue, float64(state), id, service.Host, service.Binary, service.Status, service.Zone, service.DisabledReason)
+		emitGauge(ch, e.descs.AgentState, state, id, agent.Host, agent.Binary, agent.Status, agent.Zone, agent.DisabledReason)
 	}
-
 	return nil
 }
 
-func ListCinderPoolCapacityFree(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	listOpts := schedulerstats.ListOpts{
-		Detail: true,
+func (e *CinderExporter) emitPools(_ context.Context, s *cinderScrape, ch chan<- prometheus.Metric) error {
+	for i := range s.pools {
+		pool := &s.pools[i]
+		emitGauge(ch, e.descs.PoolCapacityFreeGB, float64(pool.Capabilities.FreeCapacityGB),
+			pool.Name, pool.Capabilities.VolumeBackendName, pool.Capabilities.VendorName)
+		emitGauge(ch, e.descs.PoolCapacityTotalGB, float64(pool.Capabilities.TotalCapacityGB),
+			pool.Name, pool.Capabilities.VolumeBackendName, pool.Capabilities.VendorName)
 	}
-
-	allPages, err := schedulerstats.List(exporter.ClientV2, listOpts).AllPages(ctx)
-	if err != nil {
-		return err
-	}
-
-	allStats, err := schedulerstats.ExtractStoragePools(allPages)
-	if err != nil {
-		return err
-	}
-
-	for _, stat := range allStats {
-		ch <- prometheus.MustNewConstMetric(exporter.Metrics["pool_capacity_free_gb"].Metric, prometheus.GaugeValue,
-			float64(stat.Capabilities.FreeCapacityGB), stat.Name, stat.Capabilities.VolumeBackendName, stat.Capabilities.VendorName)
-		ch <- prometheus.MustNewConstMetric(exporter.Metrics["pool_capacity_total_gb"].Metric, prometheus.GaugeValue,
-			float64(stat.Capabilities.TotalCapacityGB), stat.Name, stat.Capabilities.VolumeBackendName, stat.Capabilities.VendorName)
-	}
-
 	return nil
 }
 
-func ListVolumeLimits(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	allProjects, err := GetProjects(ctx, exporter)
-	if err != nil {
-		return err
-	}
-
-	for _, p := range allProjects {
-		// Limits are obtained from the cinder API, so now we can just use this exporter's client
-		limits, err := quotasets.GetUsage(ctx, exporter.ClientV2, p.ID).Extract()
-		if err != nil {
-			return err
-		}
-
-		// Quotas are obtained from the cinder API
-		quotas_p, err := quotasets.Get(ctx, exporter.ClientV2, p.ID).Extract()
-		if err != nil {
-			return err
-		}
-		quotas := *quotas_p
+func (e *CinderExporter) emitLimits(_ context.Context, s *cinderScrape, ch chan<- prometheus.Metric) error {
+	for i := range s.limits {
+		lim := &s.limits[i]
 
 		// Loop through all Extra quotas to automatically detect volume types
-		for key, value := range quotas.Extra {
+		for key, value := range lim.quotas.Extra {
 			if strings.HasPrefix(key, "gigabytes_") {
 				volumeType := strings.TrimPrefix(key, "gigabytes_")
 				if quotaValue, ok := value.(float64); ok {
-					ch <- prometheus.MustNewConstMetric(exporter.Metrics["volume_type_quota_gigabytes"].Metric,
-						prometheus.GaugeValue, quotaValue, p.Name, p.ID, volumeType)
+					emitGauge(ch, e.descs.VolumeTypeQuota, quotaValue, lim.projectName, lim.projectID, volumeType)
 				}
 			}
 		}
 
-		ch <- prometheus.MustNewConstMetric(exporter.Metrics["limits_volume_max_gb"].Metric,
-			prometheus.GaugeValue, float64(limits.Gigabytes.Limit), p.Name, p.ID)
-
-		ch <- prometheus.MustNewConstMetric(exporter.Metrics["limits_volume_used_gb"].Metric,
-			prometheus.GaugeValue, float64(limits.Gigabytes.InUse), p.Name, p.ID)
-
-		ch <- prometheus.MustNewConstMetric(exporter.Metrics["limits_backup_max_gb"].Metric,
-			prometheus.GaugeValue, float64(limits.BackupGigabytes.Limit), p.Name, p.ID)
-
-		ch <- prometheus.MustNewConstMetric(exporter.Metrics["limits_backup_used_gb"].Metric,
-			prometheus.GaugeValue, float64(limits.BackupGigabytes.InUse), p.Name, p.ID)
+		emitGauge(ch, e.descs.LimitsVolumeMaxGB, float64(lim.usage.Gigabytes.Limit), lim.projectName, lim.projectID)
+		emitGauge(ch, e.descs.LimitsVolumeUsedGB, float64(lim.usage.Gigabytes.InUse), lim.projectName, lim.projectID)
+		emitGauge(ch, e.descs.LimitsBackupMaxGB, float64(lim.usage.BackupGigabytes.Limit), lim.projectName, lim.projectID)
+		emitGauge(ch, e.descs.LimitsBackupUsedGB, float64(lim.usage.BackupGigabytes.InUse), lim.projectName, lim.projectID)
 	}
-
 	return nil
 }
 

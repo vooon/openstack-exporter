@@ -75,7 +75,7 @@ openstack_loadbalancer_up 1
 `
 
 func (suite *LoadbalancerTestSuite) TestLoadbalancerExporter() {
-	err := testutil.CollectAndCompare(*suite.Exporter, strings.NewReader(loadbalancerExpectedUp))
+	err := testutil.CollectAndCompare(*suite.Exporter, strings.NewReader(loadbalancerExpectedUp), metricNamesFrom(loadbalancerExpectedUp)...)
 	assert.NoError(suite.T(), err)
 }
 
@@ -135,7 +135,7 @@ func (suite *LoadbalancerTestSuite) TestLoadbalancerExporterWithSingleStatsMetri
 	})
 
 	expected := withoutMetrics(loadbalancerExpectedUp, "stats_bytes_out", "listener_stats_bytes_out")
-	err := testutil.CollectAndCompare(exporter, strings.NewReader(expected))
+	err := testutil.CollectAndCompare(exporter, strings.NewReader(expected), metricNamesFrom(expected)...)
 	assert.NoError(suite.T(), err)
 }
 
@@ -146,7 +146,7 @@ func (suite *LoadbalancerTestSuite) TestLoadbalancerExporterWithStatsBytesInDisa
 	})
 
 	expected := withoutMetrics(loadbalancerExpectedUp, "stats_bytes_in", "listener_stats_bytes_in")
-	err := testutil.CollectAndCompare(exporter, strings.NewReader(expected))
+	err := testutil.CollectAndCompare(exporter, strings.NewReader(expected), metricNamesFrom(expected)...)
 	assert.NoError(suite.T(), err)
 }
 
@@ -159,7 +159,7 @@ func (suite *LoadbalancerTestSuite) TestLoadbalancerExporterWithAllStatsMetricsD
 	exporter := suite.newExporterWithDisabledMetrics(disabled)
 
 	expected := withoutMetrics(loadbalancerExpectedUp, names...)
-	err := testutil.CollectAndCompare(exporter, strings.NewReader(expected))
+	err := testutil.CollectAndCompare(exporter, strings.NewReader(expected), metricNamesFrom(expected)...)
 	assert.NoError(suite.T(), err)
 
 	// No stats API calls should be made when every stats metric is disabled.

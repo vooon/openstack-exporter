@@ -13,6 +13,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+func init() {
+	RegisterTypedExporter("baremetal", NewIronicExporter)
+}
+
 const (
 	ironicLatestSupportedMicroversion = "1.90"
 	// The detailed node endpoint enforces a positive limit and may omit
@@ -25,12 +29,18 @@ const (
 // IronicExporter : extends BaseOpenStackExporter
 type IronicExporter struct {
 	BaseOpenStackExporter
+	descs ironicDescs
+	sched Schedule[ironicScrape]
 }
 
-var defaultIronicMetrics = []Metric{
-	{Name: "node", Labels: []string{"id", "name", "provision_state", "power_state", "maintenance", "maintenance_reason", "conductor_group", "traits", "instance_uuid", "lessee", "last_error", "serial_number", "console_enabled", "resource_class", "deploy_kernel", "deploy_ramdisk", "retired", "retired_reason"}, Fn: ListNodes},
-	{Name: "node_updated_at", Labels: []string{"id", "name", "provision_state"}, Fn: nil},
-	{Name: "node_provision_updated_at", Labels: []string{"id", "name", "provision_state"}, Fn: nil},
+type ironicDescs struct {
+	Node                   *prometheus.Desc `metric:"node"                      labels:"id,name,provision_state,power_state,maintenance,maintenance_reason,conductor_group,traits,instance_uuid,lessee,last_error,serial_number,console_enabled,resource_class,deploy_kernel,deploy_ramdisk,retired,retired_reason"`
+	NodeUpdatedAt          *prometheus.Desc `metric:"node_updated_at"           labels:"id,name,provision_state"`
+	NodeProvisionUpdatedAt *prometheus.Desc `metric:"node_provision_updated_at" labels:"id,name,provision_state"`
+}
+
+type ironicScrape struct {
+	nodes []nodes.Node
 }
 
 // NewIronicExporter : returns a pointer to IronicExporter
@@ -47,24 +57,31 @@ func NewIronicExporter(config *ExporterConfig, logger *slog.Logger) (*IronicExpo
 		return nil, err
 	}
 
-	exporter := IronicExporter{
-		BaseOpenStackExporter{
+	e := &IronicExporter{
+		BaseOpenStackExporter: BaseOpenStackExporter{
 			Name:           "ironic",
 			ExporterConfig: *config,
 			logger:         logger,
 		},
 	}
-
-	for _, metric := range defaultIronicMetrics {
-		if exporter.isDeprecatedMetric(&metric) {
-			continue
-		}
-		if !exporter.isSlowMetric(&metric) {
-			exporter.AddMetric(metric.Name, metric.Fn, metric.Labels, metric.DeprecatedVersion, nil)
-		}
+	graph := Graph[ironicScrape]{
+		Sources: []Source[ironicScrape]{
+			{Name: "nodes", Fetch: e.fetchNodes},
+		},
+		Emitters: []Emitter[ironicScrape]{
+			{Name: "nodes", Metrics: []string{"node", "node_updated_at", "node_provision_updated_at"}, Sources: []string{"nodes"}, Emit: e.emitNodes},
+		},
 	}
+	sched, err := SetupExporter(&e.BaseOpenStackExporter, &e.descs, &graph)
+	if err != nil {
+		return nil, err
+	}
+	e.sched = sched
+	return e, nil
+}
 
-	return &exporter, nil
+func (e *IronicExporter) Collect(ch chan<- prometheus.Metric) {
+	CollectSchedule(&e.BaseOpenStackExporter, &e.sched, new(ironicScrape), ch)
 }
 
 // listAllNodes returns every node, paging on an explicit marker under a stable
@@ -102,44 +119,30 @@ func listAllNodes(ctx context.Context, client *gophercloudv2.ServiceClient) ([]n
 	}
 }
 
-// ListNodes : list nodes
-func ListNodes(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	allNodes, err := listAllNodes(ctx, exporter.ClientV2)
-	if err != nil {
-		return err
-	}
+func (e *IronicExporter) fetchNodes(ctx context.Context, s *ironicScrape) error {
+	var err error
+	s.nodes, err = listAllNodes(ctx, e.ClientV2)
+	return err
+}
 
-	for _, node := range allNodes {
+func (e *IronicExporter) emitNodes(_ context.Context, s *ironicScrape, ch chan<- prometheus.Metric) error {
+	for i := range s.nodes {
+		node := &s.nodes[i]
 		deployKernel := getDriverInfoString(node.DriverInfo, "deploy_kernel")
 		deployRamdisk := getDriverInfoString(node.DriverInfo, "deploy_ramdisk")
 		serialNumber := getNestedExtraString(node.Extra, "system_vendor", "serial_number")
 
-		ch <- prometheus.MustNewConstMetric(exporter.Metrics["node"].Metric,
-			prometheus.GaugeValue, 1.0, node.UUID, node.Name, node.ProvisionState, node.PowerState,
+		emitGauge(ch, e.descs.Node, 1.0, node.UUID, node.Name, node.ProvisionState, node.PowerState,
 			strconv.FormatBool(node.Maintenance), sanitizeMetricString(node.MaintenanceReason), node.ConductorGroup, strings.Join(node.Traits, " "),
 			node.InstanceUUID, node.Lessee, sanitizeMetricString(node.LastError), serialNumber, strconv.FormatBool(node.ConsoleEnabled), node.ResourceClass,
 			deployKernel, deployRamdisk, strconv.FormatBool(node.Retired), node.RetiredReason)
 
 		if !node.UpdatedAt.IsZero() {
-			ch <- prometheus.MustNewConstMetric(
-				exporter.Metrics["node_updated_at"].Metric,
-				prometheus.GaugeValue,
-				float64(node.UpdatedAt.Unix()),
-				node.UUID,
-				node.Name,
-				node.ProvisionState,
-			)
+			emitGauge(ch, e.descs.NodeUpdatedAt, float64(node.UpdatedAt.Unix()), node.UUID, node.Name, node.ProvisionState)
 		}
 
 		if !node.ProvisionUpdatedAt.IsZero() {
-			ch <- prometheus.MustNewConstMetric(
-				exporter.Metrics["node_provision_updated_at"].Metric,
-				prometheus.GaugeValue,
-				float64(node.ProvisionUpdatedAt.Unix()),
-				node.UUID,
-				node.Name,
-				node.ProvisionState,
-			)
+			emitGauge(ch, e.descs.NodeProvisionUpdatedAt, float64(node.ProvisionUpdatedAt.Unix()), node.UUID, node.Name, node.ProvisionState)
 		}
 	}
 

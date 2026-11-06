@@ -9,70 +9,87 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-type GnocchiExporter struct {
-	BaseOpenStackExporter
+func init() {
+	RegisterTypedExporter("gnocchi", NewGnocchiExporter)
 }
 
-var defaultGnocchiMetrics = []Metric{
-	{Name: "status_metricd_processors", Fn: getMetricStatus},
-	{Name: "status_metric_having_measures_to_process", Fn: nil},
-	{Name: "status_measures_to_process", Fn: nil},
-	{Name: "total_metrics", Fn: ListAllMetrics},
+type GnocchiExporter struct {
+	BaseOpenStackExporter
+	descs gnocchiDescs
+	sched Schedule[gnocchiScrape]
+}
+
+type gnocchiDescs struct {
+	StatusMetricdProcessors             *prometheus.Desc `metric:"status_metricd_processors"`
+	StatusMetricHavingMeasuresToProcess *prometheus.Desc `metric:"status_metric_having_measures_to_process"`
+	StatusMeasuresToProcess             *prometheus.Desc `metric:"status_measures_to_process"`
+	TotalMetrics                        *prometheus.Desc `metric:"total_metrics"`
+}
+
+type gnocchiScrape struct {
+	status  *status.Status
+	metrics []metrics.Metric
 }
 
 func NewGnocchiExporter(config *ExporterConfig, logger *slog.Logger) (*GnocchiExporter, error) {
-	exporter := GnocchiExporter{
-		BaseOpenStackExporter{
+	e := &GnocchiExporter{
+		BaseOpenStackExporter: BaseOpenStackExporter{
 			Name:           "gnocchi",
 			ExporterConfig: *config,
 			logger:         logger,
 		},
 	}
-
-	for _, metric := range defaultGnocchiMetrics {
-		if exporter.isDeprecatedMetric(&metric) {
-			continue
-		}
-		if !exporter.isSlowMetric(&metric) {
-			exporter.AddMetric(metric.Name, metric.Fn, metric.Labels, metric.DeprecatedVersion, nil)
-		}
+	graph := Graph[gnocchiScrape]{
+		Sources: []Source[gnocchiScrape]{
+			{Name: "status", Fetch: e.fetchStatus},
+			{Name: "metrics", Fetch: e.fetchMetrics},
+		},
+		Emitters: []Emitter[gnocchiScrape]{
+			{
+				Name:    "status",
+				Metrics: []string{"status_metricd_processors", "status_metric_having_measures_to_process", "status_measures_to_process"},
+				Sources: []string{"status"},
+				Emit:    e.emitStatus,
+			},
+			{Name: "metrics", Metrics: []string{"total_metrics"}, Sources: []string{"metrics"}, Emit: e.emitMetrics},
+		},
 	}
-
-	return &exporter, nil
+	sched, err := SetupExporter(&e.BaseOpenStackExporter, &e.descs, &graph)
+	if err != nil {
+		return nil, err
+	}
+	e.sched = sched
+	return e, nil
 }
 
-func ListAllMetrics(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	var allMetrics []metrics.Metric
+func (e *GnocchiExporter) Collect(ch chan<- prometheus.Metric) {
+	CollectSchedule(&e.BaseOpenStackExporter, &e.sched, new(gnocchiScrape), ch)
+}
 
-	allPagesMetrics, err := metrics.List(exporter.ClientV2, metrics.ListOpts{}).AllPages(ctx)
+func (e *GnocchiExporter) fetchStatus(ctx context.Context, s *gnocchiScrape) error {
+	details := true
+	var err error
+	s.status, err = status.Get(ctx, e.ClientV2, status.GetOpts{Details: &details}).Extract()
+	return err
+}
+
+func (e *GnocchiExporter) fetchMetrics(ctx context.Context, s *gnocchiScrape) error {
+	allPages, err := metrics.List(e.ClientV2, metrics.ListOpts{}).AllPages(ctx)
 	if err != nil {
 		return err
 	}
+	s.metrics, err = metrics.ExtractMetrics(allPages)
+	return err
+}
 
-	allMetrics, err = metrics.ExtractMetrics(allPagesMetrics)
-	if err != nil {
-		return err
-	}
-
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["total_metrics"].Metric,
-		prometheus.GaugeValue, float64(len(allMetrics)))
-
+func (e *GnocchiExporter) emitStatus(_ context.Context, s *gnocchiScrape, ch chan<- prometheus.Metric) error {
+	emitGauge(ch, e.descs.StatusMetricdProcessors, float64(len(s.status.Metricd.Processors)))
+	emitGauge(ch, e.descs.StatusMetricHavingMeasuresToProcess, float64(s.status.Storage.Summary.Metrics))
+	emitGauge(ch, e.descs.StatusMeasuresToProcess, float64(s.status.Storage.Summary.Measures))
 	return nil
 }
 
-func getMetricStatus(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	details := true
-	metricStatus, err := status.Get(ctx, exporter.ClientV2, status.GetOpts{Details: &details}).Extract()
-	if err != nil {
-		return err
-	}
-
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["status_metricd_processors"].Metric,
-		prometheus.GaugeValue, float64(len(metricStatus.Metricd.Processors)))
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["status_metric_having_measures_to_process"].Metric,
-		prometheus.GaugeValue, float64(metricStatus.Storage.Summary.Metrics))
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["status_measures_to_process"].Metric,
-		prometheus.GaugeValue, float64(metricStatus.Storage.Summary.Measures))
-
+func (e *GnocchiExporter) emitMetrics(_ context.Context, s *gnocchiScrape, ch chan<- prometheus.Metric) error {
+	emitGauge(ch, e.descs.TotalMetrics, float64(len(s.metrics)))
 	return nil
 }
