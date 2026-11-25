@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -31,12 +32,61 @@ type IronicExporter struct {
 	BaseOpenStackExporter
 	descs ironicDescs
 	sched Schedule[ironicScrape]
+	// nodeDesc carries the fixed node labels plus the operator-configured
+	// IronicNodeExtraLabels, so it is built at construction instead of from a
+	// struct tag.
+	nodeDesc   *prometheus.Desc
+	nodeExtras *utils.LabelMappingFlag
 }
 
 type ironicDescs struct {
-	Node                   *prometheus.Desc `metric:"node"                      labels:"id,name,provision_state,power_state,maintenance,maintenance_reason,conductor_group,traits,instance_uuid,lessee,last_error,serial_number,console_enabled,resource_class,deploy_kernel,deploy_ramdisk,retired,retired_reason"`
 	NodeUpdatedAt          *prometheus.Desc `metric:"node_updated_at"           labels:"id,name,provision_state"`
 	NodeProvisionUpdatedAt *prometheus.Desc `metric:"node_provision_updated_at" labels:"id,name,provision_state"`
+}
+
+// ironicNodeBaseLabels are the fixed labels of the node metric, before the
+// operator-configured labels are appended.
+var ironicNodeBaseLabels = []string{"id", "name", "provision_state", "power_state", "maintenance", "maintenance_reason",
+	"conductor_group", "traits", "instance_uuid", "lessee", "last_error", "serial_number", "console_enabled", "resource_class",
+	"retired", "retired_reason"}
+
+// DefaultIronicNodeExtraLabels reproduces the deploy_kernel and deploy_ramdisk
+// labels that openstack_ironic_node carried before the mapping existed, so the
+// default output is unchanged. Operators who do not want these labels can drop
+// them by passing an empty value.
+const DefaultIronicNodeExtraLabels = "driver_info.deploy_kernel,driver_info.deploy_ramdisk"
+
+// NewIronicNodeExtraLabels returns the default node label mapping, for callers
+// that build ExporterOptions without going through the CLI flag.
+func NewIronicNodeExtraLabels() *utils.LabelMappingFlag {
+	m := &utils.LabelMappingFlag{DeriveLabelFromLeaf: true}
+	if err := m.Set(DefaultIronicNodeExtraLabels); err != nil {
+		panic(err) // constant input, cannot fail
+	}
+	return m
+}
+
+// ironicNodeInfoMaps are the node dictionaries whose keys may be mapped to
+// labels. A mapping key is qualified with one of these names, for example
+// `driver_info.deploy_kernel`.
+var ironicNodeInfoMaps = []string{"driver_info", "instance_info", "extra", "properties", "driver_internal_info"}
+
+// IronicNodeInfoMaps returns the node dictionaries whose keys can be mapped to
+// labels, for use in the CLI flag help.
+func IronicNodeInfoMaps() []string {
+	return slices.Clone(ironicNodeInfoMaps)
+}
+
+// ironicNodeNestedMaps exposes the allowlisted node dictionaries to the label
+// mapping helper, which owns the lookup and redaction rules.
+func ironicNodeNestedMaps(node *nodes.Node) []utils.NestedMap {
+	return []utils.NestedMap{
+		{Name: "driver_info", Values: node.DriverInfo},
+		{Name: "instance_info", Values: node.InstanceInfo},
+		{Name: "extra", Values: node.Extra},
+		{Name: "properties", Values: node.Properties},
+		{Name: "driver_internal_info", Values: node.DriverInternalInfo},
+	}
 }
 
 type ironicScrape struct {
@@ -63,7 +113,18 @@ func NewIronicExporter(config *ExporterConfig, logger *slog.Logger) (*IronicExpo
 			ExporterConfig: *config,
 			logger:         logger,
 		},
+		nodeExtras: config.IronicNodeExtraLabels,
 	}
+	if e.nodeExtras == nil {
+		e.nodeExtras = NewIronicNodeExtraLabels()
+	}
+	if err := e.nodeExtras.ValidateNestedKeys(ironicNodeInfoMaps...); err != nil {
+		return nil, fmt.Errorf("ironic.node-extra-labels: %w", err)
+	}
+	if err := e.nodeExtras.ValidateAgainst(ironicNodeBaseLabels); err != nil {
+		return nil, fmt.Errorf("ironic.node-extra-labels: %w", err)
+	}
+
 	graph := Graph[ironicScrape]{
 		Sources: []Source[ironicScrape]{
 			{Name: "nodes", Fetch: e.fetchNodes},
@@ -72,7 +133,17 @@ func NewIronicExporter(config *ExporterConfig, logger *slog.Logger) (*IronicExpo
 			{Name: "nodes", Metrics: []string{"node", "node_updated_at", "node_provision_updated_at"}, Sources: []string{"nodes"}, Emit: e.emitNodes},
 		},
 	}
-	sched, err := SetupExporter(&e.BaseOpenStackExporter, &e.descs, &graph)
+	// node carries operator-configured labels, so its descriptor cannot come
+	// from a struct tag and is declared dynamically.
+	nodeMetric := WithDynamicMetrics([]string{"node"}, func(base *BaseOpenStackExporter) {
+		if !base.IsMetricEnabled("node") {
+			return
+		}
+		labels := append(slices.Clone(ironicNodeBaseLabels), e.nodeExtras.Labels...)
+		e.nodeDesc = prometheus.NewDesc(prometheus.BuildFQName(base.GetName(), "", "node"), "node", labels, nil)
+		base.RegisterDesc(e.nodeDesc)
+	})
+	sched, err := SetupExporter(&e.BaseOpenStackExporter, &e.descs, &graph, nodeMetric)
 	if err != nil {
 		return nil, err
 	}
@@ -128,14 +199,14 @@ func (e *IronicExporter) fetchNodes(ctx context.Context, s *ironicScrape) error 
 func (e *IronicExporter) emitNodes(_ context.Context, s *ironicScrape, ch chan<- prometheus.Metric) error {
 	for i := range s.nodes {
 		node := &s.nodes[i]
-		deployKernel := getDriverInfoString(node.DriverInfo, "deploy_kernel")
-		deployRamdisk := getDriverInfoString(node.DriverInfo, "deploy_ramdisk")
 		serialNumber := getNestedExtraString(node.Extra, "system_vendor", "serial_number")
 
-		emitGauge(ch, e.descs.Node, 1.0, node.UUID, node.Name, node.ProvisionState, node.PowerState,
+		labelValues := []string{node.UUID, node.Name, node.ProvisionState, node.PowerState,
 			strconv.FormatBool(node.Maintenance), sanitizeMetricString(node.MaintenanceReason), node.ConductorGroup, strings.Join(node.Traits, " "),
 			node.InstanceUUID, node.Lessee, sanitizeMetricString(node.LastError), serialNumber, strconv.FormatBool(node.ConsoleEnabled), node.ResourceClass,
-			deployKernel, deployRamdisk, strconv.FormatBool(node.Retired), node.RetiredReason)
+			strconv.FormatBool(node.Retired), node.RetiredReason}
+		labelValues = append(labelValues, e.nodeExtras.ExtractNestedAny(ironicNodeNestedMaps(node)...)...)
+		emitGauge(ch, e.nodeDesc, 1.0, labelValues...)
 
 		if !node.UpdatedAt.IsZero() {
 			emitGauge(ch, e.descs.NodeUpdatedAt, float64(node.UpdatedAt.Unix()), node.UUID, node.Name, node.ProvisionState)
@@ -182,18 +253,4 @@ func getNestedExtraString(extra map[string]any, key string, nestedKey string) st
 
 func sanitizeMetricString(value string) string {
 	return strings.TrimSpace(strings.ReplaceAll(value, "\n", " "))
-}
-
-func getDriverInfoString(driverInfo map[string]any, key string) string {
-	v, ok := driverInfo[key]
-	if !ok {
-		return ""
-	}
-
-	s, ok := v.(string)
-	if !ok {
-		return ""
-	}
-
-	return s
 }
