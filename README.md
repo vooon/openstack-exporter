@@ -130,6 +130,11 @@ Flags:
       --reload-interval=1h       How often services are re-detected and every
                                  collector is re-bound; SIGHUP reloads at any
                                  time; 0 disables the timer
+      --api-detail-concurrent-count=10
+                                 Number of concurrent requests for per-resource API detail collection
+                                 (project limits and quotas, router L3 agents)
+      --placement-concurrent-count=10
+                                 Number of concurrent requests for Placement provider detail collection
       --[no-]disable-service.network
                                  Disable the network service exporter in strict mode
       --[no-]disable-service.compute
