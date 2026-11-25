@@ -142,19 +142,11 @@ func (exporter *BaseOpenStackExporter) metricPolicy() map[string]bool {
 // IsMetricEnabled reports whether any of the given metrics is collected.
 // Passing several names guards an API call that feeds multiple metrics.
 //
-// Exporters built with SetupExporter answer from the resolved policy, which
-// accounts for all four enable/disable flags. Exporters on the legacy
-// callback engine answer from --disable-metric alone. An unknown name is
-// reported as enabled and logged, since silently dropping a metric over a
-// typo would be worse.
+// The answer comes from the policy resolved by SetupExporter, which accounts
+// for all four enable/disable flags. An unknown name is reported as enabled
+// and logged, since silently dropping a metric over a typo would be worse.
 func (exporter *BaseOpenStackExporter) IsMetricEnabled(names ...string) bool {
 	for _, name := range names {
-		if exporter.metricEnabled == nil {
-			if !exporter.MetricIsDisabled(name) {
-				return true
-			}
-			continue
-		}
 		enabled, known := exporter.metricEnabled[name]
 		if !known {
 			exporter.log().Warn("unknown metric queried; treating as enabled", "metric", name, "exporter", exporter.Name)

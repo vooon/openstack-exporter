@@ -9,86 +9,77 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-type GlanceExporter struct {
-	BaseOpenStackExporter
+func init() {
+	RegisterTypedExporter("image", NewGlanceExporter)
 }
 
-var defaultGlanceMetrics = []Metric{
-	{Name: "images", Fn: ListImages},
-	{Name: "image_bytes", Labels: []string{"id", "name", "tenant_id", "image_type"},
-		Fn: ListImageProperties, Slow: true},
-	{Name: "image_created_at", Labels: []string{"id", "name", "tenant_id", "visibility",
-		"hidden", "status", "image_type"}, Slow: true},
+type GlanceExporter struct {
+	BaseOpenStackExporter
+	descs glanceDescs
+	sched Schedule[glanceScrape]
+}
+
+type glanceDescs struct {
+	Images         *prometheus.Desc `metric:"images"`
+	ImageBytes     *prometheus.Desc `metric:"image_bytes"      labels:"id,name,tenant_id,image_type"                                     slow:"true"`
+	ImageCreatedAt *prometheus.Desc `metric:"image_created_at" labels:"id,name,tenant_id,visibility,hidden,status,image_type" slow:"true"`
+}
+
+type glanceScrape struct {
+	images []images.Image
 }
 
 func NewGlanceExporter(config *ExporterConfig, logger *slog.Logger) (*GlanceExporter, error) {
-	exporter := GlanceExporter{
-		BaseOpenStackExporter{
+	e := &GlanceExporter{
+		BaseOpenStackExporter: BaseOpenStackExporter{
 			Name:           "glance",
 			ExporterConfig: *config,
 			logger:         logger,
 		},
 	}
-
-	for _, metric := range defaultGlanceMetrics {
-		if exporter.isDeprecatedMetric(&metric) {
-			continue
-		}
-		if !exporter.isSlowMetric(&metric) {
-			exporter.AddMetric(metric.Name, metric.Fn, metric.Labels, metric.DeprecatedVersion, nil)
-		}
+	graph := Graph[glanceScrape]{
+		Sources: []Source[glanceScrape]{
+			{Name: "images", Fetch: e.fetchImages},
+		},
+		Emitters: []Emitter[glanceScrape]{
+			{Name: "count", Metrics: []string{"images"}, Sources: []string{"images"}, Emit: e.emitCount},
+			{Name: "properties", Metrics: []string{"image_bytes", "image_created_at"}, Sources: []string{"images"}, Emit: e.emitProperties},
+		},
 	}
-
-	return &exporter, nil
-}
-
-func getAllImages(ctx context.Context, exporter *BaseOpenStackExporter) ([]images.Image, error) {
-	var allImages []images.Image
-
-	allPagesImage, err := images.List(exporter.ClientV2, images.ListOpts{}).AllPages(ctx)
+	sched, err := SetupExporter(&e.BaseOpenStackExporter, &e.descs, &graph)
 	if err != nil {
 		return nil, err
 	}
-
-	allImages, err = images.ExtractImages(allPagesImage)
-	if err != nil {
-		return nil, err
-	}
-
-	return allImages, nil
+	e.sched = sched
+	return e, nil
 }
 
-func ListImages(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	allImages, err := getAllImages(ctx, exporter)
+func (e *GlanceExporter) Collect(ch chan<- prometheus.Metric) {
+	CollectSchedule(&e.BaseOpenStackExporter, &e.sched, new(glanceScrape), ch)
+}
+
+func (e *GlanceExporter) fetchImages(ctx context.Context, s *glanceScrape) error {
+	allPages, err := images.List(e.ClientV2, images.ListOpts{}).AllPages(ctx)
 	if err != nil {
 		return err
 	}
+	s.images, err = images.ExtractImages(allPages)
+	return err
+}
 
-	ch <- prometheus.MustNewConstMetric(exporter.Metrics["images"].Metric,
-		prometheus.GaugeValue, float64(len(allImages)))
-
+func (e *GlanceExporter) emitCount(_ context.Context, s *glanceScrape, ch chan<- prometheus.Metric) error {
+	emitGauge(ch, e.descs.Images, float64(len(s.images)))
 	return nil
 }
 
-func ListImageProperties(ctx context.Context, exporter *BaseOpenStackExporter, ch chan<- prometheus.Metric) error {
-	// Image size and created at metrics
-	allImages, err := getAllImages(ctx, exporter)
-	if err != nil {
-		return err
+func (e *GlanceExporter) emitProperties(_ context.Context, s *glanceScrape, ch chan<- prometheus.Metric) error {
+	for i := range s.images {
+		image := &s.images[i]
+		imageType := getImageType(image)
+		emitGauge(ch, e.descs.ImageBytes, float64(image.SizeBytes), image.ID, image.Name, image.Owner, imageType)
+		emitGauge(ch, e.descs.ImageCreatedAt, float64(image.CreatedAt.Unix()), image.ID, image.Name,
+			image.Owner, string(image.Visibility), strconv.FormatBool(image.Hidden), string(image.Status), imageType)
 	}
-
-	for _, image := range allImages {
-		imageType := getImageType(&image)
-		ch <- prometheus.MustNewConstMetric(exporter.Metrics["image_bytes"].Metric,
-			prometheus.GaugeValue, float64(image.SizeBytes), image.ID, image.Name,
-			image.Owner, imageType)
-		ch <- prometheus.MustNewConstMetric(exporter.Metrics["image_created_at"].Metric,
-			prometheus.GaugeValue, float64(image.CreatedAt.Unix()), image.ID, image.Name,
-			image.Owner, string(image.Visibility), strconv.FormatBool(image.Hidden), string(image.Status),
-			imageType)
-
-	}
-
 	return nil
 }
 
